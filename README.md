@@ -6,7 +6,7 @@ This helper scans your VirtualDJ playlists, virtual folders, and database for mi
 
 The default mode is a dry run. Nothing is edited unless you explicitly apply fixes.
 
-The helper does not read or match audio tag metadata. Matching is based on missing file paths, filenames, file sizes when available, optional whitespace repair, and optional byte-identical duplicate checks.
+The helper does not read or match audio tag metadata. Matching is based on missing file paths, filenames, file sizes when available, optional whitespace repair, optional byte-identical candidate checks, and optional duplicate cleanup inside each playlist.
 
 ## What It Supports
 
@@ -19,7 +19,8 @@ The helper does not read or match audio tag metadata. Matching is based on missi
 - CSV reports for review
 - Backups before any edit
 - Stop and resume for interrupted direct folder scans
-- Exact duplicate candidate deduplication
+- Byte-identical duplicate candidate resolution
+- Duplicate entry removal inside each individual playlist
 - Optional Everything `es.exe` support for fast indexed searching
 - Direct folder scanning fallback when Everything CLI is unavailable
 
@@ -49,11 +50,13 @@ The helper is conservative:
 
 - If a file size is available, it only auto-fixes when filename and size both match.
 - If no file size is available, it only auto-fixes when exactly one filename match exists.
-- Ambiguous duplicates are skipped unless they are byte-identical and deduplication is enabled.
+- Ambiguous relocation candidates are skipped unless they are byte-identical and candidate deduplication is enabled.
 - Size mismatches are skipped, except for the whitespace parent-folder repair case described below.
 - Missing files that cannot be found are skipped.
 
-When duplicate candidates are byte-identical, the helper can deduplicate the reference by selecting one canonical path. It does not delete audio files.
+When duplicate relocation candidates are byte-identical, the helper can resolve the reference by selecting one canonical path. It does not delete audio files.
+
+When duplicate song entries appear inside the same playlist, the helper can remove later duplicate rows and keep the first occurrence. This cleanup is playlist-local: the same song can still appear in different playlists. It removes rows when the final path is the same, or when different existing paths have the same filename, same size, and same SHA-256 content hash.
 
 When filename spacing differs, for example `Artist - Song .mp3` versus `Artist - Song.mp3`, the helper can use a whitespace-normalized fallback. If multiple candidates are found, it only selects one when file size or the missing path's parent folder isolates a single candidate.
 
@@ -102,7 +105,8 @@ C:\Program Files\Everything
 Test it in PowerShell:
 
 ```powershell
-where es
+where.exe es.exe
+Get-Command es.exe
 es.exe -n 5 -full-path-and-name "test.mp3"
 ```
 
@@ -150,11 +154,15 @@ These folders also act as a safety filter when using Everything, so the helper d
 
 6. Leave **Resume interrupted scan** checked unless you want every run to start fresh.
 
-7. Leave **Deduplicate exact matches** checked if you want byte-identical duplicate candidates to resolve to one canonical path.
+7. Leave **Resolve byte-identical candidates** checked if you want byte-identical duplicate file candidates to resolve to one canonical path.
 
 The helper verifies duplicate candidates by file size and SHA-256 content hash before choosing one. It prefers paths from the scan folders in the order you selected them.
 
-8. Leave **Repair whitespace variants** checked if you want the helper to repair filenames that only differ by extra or missing spaces.
+8. Leave **Remove playlist duplicates** checked if you want duplicate song rows removed inside each playlist.
+
+This only removes duplicate rows within the same `.m3u` or `.m3u8` playlist. It keeps the first occurrence in that playlist. The same song can remain in other playlists. Different existing paths are only treated as duplicates when they have the same filename, same size, and same SHA-256 content hash.
+
+9. Leave **Repair whitespace variants** checked if you want the helper to repair filenames that only differ by extra or missing spaces.
 
 Example:
 
@@ -168,17 +176,17 @@ A Few Good Men - Walk You Thru.mp3
 
 If multiple whitespace-normalized candidates exist, the helper uses file size first. If file size is unavailable or stale, it may use parent-folder context only when exactly one candidate is in the same immediate parent folder.
 
-9. Choose **Search mode**:
+10. Choose **Search mode**:
 
 - `auto`: use `es.exe` first, then direct folder scan if needed
 - `everything`: require `es.exe`
 - `scan`: direct folder scan only
 
-10. Click **Dry Run**.
+11. Click **Dry Run**.
 
 This writes a CSV report and makes no changes.
 
-11. Review the newest CSV in:
+12. Review the newest CSV in:
 
 ```text
 reports
@@ -190,10 +198,16 @@ Rows with this value are the fixes that would be applied:
 action = would_update
 ```
 
-Rows with this value used duplicate candidate deduplication:
+Rows with this value used byte-identical candidate resolution:
 
 ```text
 match_status = deduped_exact_duplicate
+```
+
+Rows with this value remove duplicate rows from a playlist:
+
+```text
+match_status = duplicate_playlist_entry
 ```
 
 Rows with these values used whitespace-normalized filename repair:
@@ -205,9 +219,9 @@ match_status = matched_by_normalized_filename_and_parent
 match_status = matched_by_normalized_filename_and_parent_size_mismatch
 ```
 
-12. If the report looks correct, make sure VirtualDJ is closed, then click **Apply Fixes**.
+13. If the report looks correct, make sure VirtualDJ is closed, then click **Apply Fixes**.
 
-13. Reopen VirtualDJ and check the repaired playlists.
+14. Reopen VirtualDJ and check the repaired playlists.
 
 ## Command-Line Usage
 
@@ -247,10 +261,16 @@ Ignore interrupted-scan checkpoints and start fresh:
 python .\vdj_relocator.py --no-gui --no-resume --scan-root "D:\Music"
 ```
 
-Disable exact duplicate candidate deduplication:
+Disable byte-identical candidate resolution:
 
 ```powershell
 python .\vdj_relocator.py --no-gui --no-dedupe-exact --scan-root "D:\Music"
+```
+
+Disable duplicate row cleanup inside playlists:
+
+```powershell
+python .\vdj_relocator.py --no-gui --no-playlist-dedupe --scan-root "D:\Music"
 ```
 
 Disable whitespace-normalized filename fallback:
@@ -269,7 +289,7 @@ reports\vdj-relocator-report-YYYYMMDD-HHMMSS.csv
 
 Useful columns:
 
-- `action`: `would_update`, `updated`, or `skipped`
+- `action`: `would_update`, `updated`, `would_remove_duplicate`, `removed_duplicate`, or `skipped`
 - `match_status`: how the helper classified the match
 - `reason`: why the file was updated or skipped
 - `old_path`: the missing VirtualDJ path
@@ -317,9 +337,11 @@ D:\Music\Aaliyah - Try Again.mp3
 
 If VirtualDJ stored a file size, the helper checks the candidate size too. If there are multiple possible matches or the size does not match, the entry is skipped and listed in the report.
 
-If **Deduplicate exact matches** is enabled and multiple candidates have the same filename, same size, and same SHA-256 content hash, the helper picks one canonical path and uses that as the replacement. The canonical path is selected by scan folder order first, then shorter path, then alphabetical path.
+If **Resolve byte-identical candidates** is enabled and multiple relocation candidates have the same filename, same size, and same SHA-256 content hash, the helper picks one canonical path and uses that as the replacement. The canonical path is selected by scan folder order first, then shorter path, then alphabetical path.
 
-This only updates the VirtualDJ reference. It does not remove rows from playlists and it does not delete duplicate files from disk.
+This candidate dedupe only updates the VirtualDJ reference. It does not delete audio files from disk.
+
+If **Remove playlist duplicates** is enabled, the helper then checks each playlist separately after planned path updates. It keeps the first row and removes later duplicate rows from that same playlist when the final path is the same, or when different existing paths have the same filename, same size, and same SHA-256 content hash. It does not compare one playlist against another playlist.
 
 If **Repair whitespace variants** is enabled, the helper also compares filenames after collapsing repeated spaces and trimming spaces before the extension. This handles paths like `Song .mp3` when the actual file is `Song.mp3`. This is not a general fuzzy match: spelling, punctuation, filename text, and extension still need to match after whitespace normalization.
 
@@ -331,7 +353,7 @@ When whitespace-normalized matching finds multiple candidates and file-size veri
 
 - Install the Everything Command-line Interface.
 - Make sure `es.exe` is in your `PATH` or in `C:\Program Files\Everything`.
-- Test with `where es`.
+- Test with `where.exe es.exe` or `Get-Command es.exe`.
 - Or use `search-mode = scan`.
 
 Everything returns no candidates:
@@ -343,9 +365,24 @@ Everything returns no candidates:
 The helper finds duplicates:
 
 - Review the CSV rows with `match_status = ambiguous`.
-- If they are byte-identical and **Deduplicate exact matches** is enabled, they should be reported as `deduped_exact_duplicate`.
+- If they are byte-identical and **Resolve byte-identical candidates** is enabled, they should be reported as `deduped_exact_duplicate`.
 - If they remain ambiguous, the files have different sizes or different content hashes.
 - Move duplicates out of the selected scan roots, change scan folder priority, or repair those entries manually in VirtualDJ.
+
+The helper removes playlist duplicates:
+
+- Review the CSV rows with `match_status = duplicate_playlist_entry`.
+- Duplicate playlist cleanup is per playlist only.
+- The helper keeps the first occurrence in that playlist and removes later rows with the same final path or byte-identical same-filename files.
+- The same song can still appear in other playlists.
+
+Indexing is slow:
+
+- Install `es.exe`; `Everything.exe` alone is not enough for command-line indexed searching.
+- Use `search-mode = auto` or `search-mode = everything` after `es.exe` is installed.
+- Select the narrowest scan folders that contain your relocated music.
+- Direct scan filters by needed file extensions, but it still has to walk the selected folders.
+- Everything search uses a bulk extension query per scan folder and filters filenames locally.
 
 Whitespace variant was repaired but size differs:
 

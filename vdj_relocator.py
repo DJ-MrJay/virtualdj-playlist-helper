@@ -72,6 +72,35 @@ class MissingEntry:
 
 
 @dataclasses.dataclass
+class PlaylistRecord:
+    source_path: Path
+    reference: str
+    path_value: str
+    filename: str
+    expected_size: int | None
+    record_start: int
+    record_end: int
+    path_start: int
+    path_end: int
+
+
+@dataclasses.dataclass
+class PlaylistDuplicate:
+    duplicate_id: int
+    source_path: Path
+    reference: str
+    old_path: str
+    final_path: str
+    kept_path: str
+    filename: str
+    edit_start: int
+    edit_end: int
+    action: str = "would_remove_duplicate"
+    match_status: str = "duplicate_playlist_entry"
+    reason: str = "Duplicate playlist entry in this playlist; keeping the first occurrence."
+
+
+@dataclasses.dataclass
 class RunOptions:
     vdj_root: Path
     scan_roots: list[Path]
@@ -84,6 +113,7 @@ class RunOptions:
     max_everything_results: int
     resume_scan: bool
     dedupe_exact_candidates: bool
+    dedupe_playlist_entries: bool
     allow_whitespace_filename_fallback: bool
 
 
@@ -97,6 +127,7 @@ class RunResult:
     ambiguous: int
     not_found: int
     deduped: int
+    playlist_duplicates: int
     skipped: int
     sources_changed: int
     search_engine: str
@@ -213,13 +244,6 @@ def normalize_filename_for_match(filename: str) -> str:
     return f"{stem}{ext}".lower()
 
 
-def normalized_display_filename(filename: str) -> str:
-    stem, ext = ntpath.splitext(filename)
-    stem = WHITESPACE_RE.sub(" ", stem).strip()
-    ext = ext.strip()
-    return f"{stem}{ext}"
-
-
 def normalize_path_component_for_match(value: str) -> str:
     return WHITESPACE_RE.sub(" ", value).strip().lower()
 
@@ -277,40 +301,70 @@ def discover_sources(vdj_root: Path, include_database: bool, log: Callable[[str]
     return sources
 
 
-def parse_m3u(source: SourceFile, existence_cache: PathExistenceCache, start_id: int) -> list[MissingEntry]:
-    entries: list[MissingEntry] = []
+def is_playlist_metadata_line(stripped: str) -> bool:
+    upper = stripped.upper()
+    return upper.startswith("#EXT") and upper != "#EXTM3U"
+
+
+def parse_playlist_records(source: SourceFile) -> list[PlaylistRecord]:
+    records: list[PlaylistRecord] = []
     offset = 0
+    metadata_start: int | None = None
     pending_size: int | None = None
-    entry_id = start_id
     for line_number, raw_line in enumerate(source.text.splitlines(keepends=True), start=1):
         content, _newline = line_content_and_newline(raw_line)
         stripped = content.strip()
-        if stripped.startswith("#EXTVDJ"):
+        if is_playlist_metadata_line(stripped):
+            if metadata_start is None:
+                metadata_start = offset
             size_match = EXTVDJ_FILESIZE_RE.search(stripped)
-            pending_size = parse_int(size_match.group(1)) if size_match else None
+            if size_match:
+                pending_size = parse_int(size_match.group(1))
         elif stripped.startswith("#") or not stripped:
             pass
         else:
             path_value = content
             filename = filename_from_path(path_value)
-            if filename and not existence_cache.exists(path_value, source.path):
-                entries.append(
-                    MissingEntry(
-                        entry_id=entry_id,
+            if filename:
+                records.append(
+                    PlaylistRecord(
                         source_path=source.path,
-                        source_kind=source.kind,
                         reference=f"line {line_number}",
-                        old_path=path_value,
+                        path_value=path_value,
                         filename=filename,
                         expected_size=pending_size,
-                        edit_start=offset,
-                        edit_end=offset + len(content),
-                        edit_format="plain",
+                        record_start=metadata_start if metadata_start is not None else offset,
+                        record_end=offset + len(raw_line),
+                        path_start=offset,
+                        path_end=offset + len(content),
                     )
                 )
-                entry_id += 1
+            metadata_start = None
             pending_size = None
         offset += len(raw_line)
+    return records
+
+
+def parse_m3u(source: SourceFile, existence_cache: PathExistenceCache, start_id: int) -> list[MissingEntry]:
+    entries: list[MissingEntry] = []
+    entry_id = start_id
+    for record in parse_playlist_records(source):
+        if not existence_cache.exists(record.path_value, source.path):
+            entries.append(
+                MissingEntry(
+                    entry_id=entry_id,
+                    source_path=source.path,
+                    source_kind=source.kind,
+                    reference=record.reference,
+                    old_path=record.path_value,
+                    filename=record.filename,
+                    expected_size=record.expected_size,
+                    edit_start=record.path_start,
+                    edit_end=record.path_end,
+                    edit_format="plain",
+                )
+            )
+            entry_id += 1
     return entries
 
 
@@ -448,8 +502,13 @@ def wanted_filename_sets(entries: list[MissingEntry], allow_whitespace: bool) ->
     return exact, normalized
 
 
+def wanted_extensions(entries: list[MissingEntry]) -> set[str]:
+    return {ntpath.splitext(entry.filename)[1].lower() for entry in entries if ntpath.splitext(entry.filename)[1]}
+
+
 def scan_fingerprint(entries: list[MissingEntry], options: RunOptions, search_engine: str) -> str:
     payload = {
+        "index_version": 2,
         "search_engine": search_engine,
         "scan_roots": [normalize_for_compare(root) for root in options.scan_roots],
         "filenames": sorted({entry.filename.lower() for entry in entries}),
@@ -500,11 +559,52 @@ def find_es_executable() -> str | None:
     return None
 
 
-def everything_queries(entries: list[MissingEntry], allow_whitespace: bool) -> list[str]:
-    queries = {entry.filename for entry in entries}
-    if allow_whitespace:
-        queries.update(normalized_display_filename(entry.filename) for entry in entries)
-    return sorted(query for query in queries if query)
+def everything_extension_query(entries: list[MissingEntry]) -> str:
+    extensions = sorted(ext.lstrip(".") for ext in wanted_extensions(entries) if ext)
+    if not extensions:
+        return ""
+    return f"ext:{';'.join(extensions)}"
+
+
+def everything_scan_root(
+    es: str,
+    root: Path,
+    query_text: str,
+    max_results: int,
+    checkpoint: SearchCheckpoint,
+    exact_wanted: set[str],
+    normalized_wanted: set[str],
+    cancel_event: threading.Event | None,
+) -> None:
+    command = [es, "-path", str(root), "-full-path-and-name"]
+    if max_results > 0:
+        command.extend(["-n", str(max_results)])
+    if query_text:
+        command.append(query_text)
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    try:
+        assert process.stdout is not None
+        for line in process.stdout:
+            check_cancel(cancel_event)
+            candidate = line.strip()
+            if not candidate or not file_is_under_root(candidate, root):
+                continue
+            if index_candidate_path(checkpoint.index, candidate, exact_wanted, normalized_wanted):
+                checkpoint.result_count += 1
+        stderr = process.stderr.read() if process.stderr is not None else ""
+        return_code = process.wait()
+    except OperationCancelled:
+        process.terminate()
+        raise
+    if return_code not in (0, 1):
+        raise RuntimeError(stderr.strip() or f"es.exe failed with exit code {return_code}")
 
 
 def build_index_everything(
@@ -523,34 +623,27 @@ def build_index_everything(
         log("Resuming Everything search checkpoint.")
     else:
         checkpoint = SearchCheckpoint(fingerprint=fingerprint, search_engine="everything")
-    queries = everything_queries(entries, options.allow_whitespace_filename_fallback)
+    query_text = everything_extension_query(entries)
     for root in options.scan_roots:
         root_text = str(root)
         root_key = normalize_for_compare(root)
         if root_key in checkpoint.completed_roots:
             continue
         check_cancel(cancel_event)
-        log(f"Searching Everything index under {root_text}...")
-        for query_text in queries:
-            check_cancel(cancel_event)
-            command = [
-                es,
-                "-path",
-                root_text,
-                "-full-path-and-name",
-                "-n",
-                str(options.max_everything_results),
-                query_text,
-            ]
-            completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
-            if completed.returncode not in (0, 1):
-                raise RuntimeError(completed.stderr.strip() or f"es.exe failed with exit code {completed.returncode}")
-            for line in completed.stdout.splitlines():
-                candidate = line.strip()
-                if not candidate or not file_is_under_root(candidate, root):
-                    continue
-                if index_candidate_path(checkpoint.index, candidate, exact_wanted, normalized_wanted):
-                    checkpoint.result_count += 1
+        if query_text:
+            log(f"Searching Everything index under {root_text} for wanted extensions...")
+        else:
+            log(f"Searching Everything index under {root_text}...")
+        everything_scan_root(
+            es,
+            root,
+            query_text,
+            options.max_everything_results,
+            checkpoint,
+            exact_wanted,
+            normalized_wanted,
+            cancel_event,
+        )
         checkpoint.completed_roots.add(root_key)
         if options.resume_scan:
             save_checkpoint(options.state_dir, checkpoint)
@@ -566,6 +659,7 @@ def build_index_by_scan(
     cancel_event: threading.Event | None,
 ) -> tuple[dict[str, list[str]], bool]:
     exact_wanted, normalized_wanted = wanted_filename_sets(entries, options.allow_whitespace_filename_fallback)
+    wanted_exts = wanted_extensions(entries)
     fingerprint = scan_fingerprint(entries, options, "scan")
     checkpoint = load_checkpoint(options.state_dir, fingerprint, "scan") if options.resume_scan else None
     if checkpoint:
@@ -595,6 +689,10 @@ def build_index_by_scan(
                                 stack.append(Path(item.path))
                             elif item.is_file(follow_symlinks=False):
                                 checkpoint.scanned_files += 1
+                                if checkpoint.scanned_files % 25000 == 0:
+                                    log(f"Scanned {checkpoint.scanned_files} files...")
+                                if wanted_exts and ntpath.splitext(item.name)[1].lower() not in wanted_exts:
+                                    continue
                                 if index_candidate_path(checkpoint.index, item.path, exact_wanted, normalized_wanted):
                                     checkpoint.result_count += 1
                         except OSError:
@@ -602,7 +700,7 @@ def build_index_by_scan(
             except OSError:
                 continue
             save_counter += 1
-            if options.resume_scan and save_counter >= 100:
+            if options.resume_scan and save_counter >= 1000:
                 checkpoint.pending_stack = [str(item) for item in stack]
                 save_checkpoint(options.state_dir, checkpoint)
                 save_counter = 0
@@ -827,6 +925,162 @@ def resolve_matches(
     log("Resolved candidate matches.")
 
 
+def playlist_reference_path(path_value: str, source_path: Path) -> Path | None:
+    cleaned = path_value.strip().strip('"')
+    if not cleaned or is_url(cleaned):
+        return None
+    expanded = os.path.expandvars(cleaned).replace("/", "\\")
+    if not is_windows_absolute(expanded):
+        return source_path.parent / expanded
+    return Path(expanded)
+
+
+def canonical_playlist_reference_key(path_value: str, source_path: Path) -> str | None:
+    resolved_path = playlist_reference_path(path_value, source_path)
+    if resolved_path is None:
+        return None
+    return normalize_for_compare(resolved_path)
+
+
+def plan_playlist_duplicate_removals(
+    sources: list[SourceFile],
+    entries: list[MissingEntry],
+    options: RunOptions,
+    log: Callable[[str], None],
+    cancel_event: threading.Event | None,
+) -> list[PlaylistDuplicate]:
+    if not options.dedupe_playlist_entries:
+        return []
+
+    replacements = {
+        (entry.source_path, entry.edit_start): entry.new_path
+        for entry in entries
+        if entry.source_kind == "playlist" and entry.action == "would_update" and entry.new_path
+    }
+    duplicates: list[PlaylistDuplicate] = []
+    duplicate_id = 1
+
+    def add_duplicate(
+        duplicate_keys: set[tuple[Path, int]],
+        source: SourceFile,
+        record: PlaylistRecord,
+        final_path: str,
+        kept_record: PlaylistRecord,
+        kept_final_path: str,
+        reason: str,
+    ) -> None:
+        nonlocal duplicate_id
+        key = (source.path, record.record_start)
+        if key in duplicate_keys:
+            return
+        duplicate_keys.add(key)
+        duplicates.append(
+            PlaylistDuplicate(
+                duplicate_id=duplicate_id,
+                source_path=source.path,
+                reference=record.reference,
+                old_path=record.path_value,
+                final_path=final_path,
+                kept_path=kept_final_path,
+                filename=record.filename,
+                edit_start=record.record_start,
+                edit_end=record.record_end,
+                reason=reason,
+            )
+        )
+        duplicate_id += 1
+
+    for source in sources:
+        if source.kind != "playlist":
+            continue
+        planned_records: list[tuple[PlaylistRecord, str]] = []
+        duplicate_keys: set[tuple[Path, int]] = set()
+        seen: dict[str, tuple[PlaylistRecord, str]] = {}
+        for record in parse_playlist_records(source):
+            check_cancel(cancel_event)
+            final_path = replacements.get((source.path, record.path_start), record.path_value)
+            planned_records.append((record, final_path))
+            key = canonical_playlist_reference_key(final_path, source.path)
+            if key is None:
+                continue
+            kept = seen.get(key)
+            if kept is None:
+                seen[key] = (record, final_path)
+                continue
+            kept_record, kept_final_path = kept
+            add_duplicate(
+                duplicate_keys,
+                source,
+                record,
+                final_path,
+                kept_record,
+                kept_final_path,
+                (
+                    "Duplicate playlist entry in this playlist; final path matches "
+                    f"the first occurrence at {kept_record.reference}."
+                ),
+            )
+        content_groups: dict[tuple[str, int], list[tuple[PlaylistRecord, str, Path]]] = {}
+        for record, final_path in planned_records:
+            if (source.path, record.record_start) in duplicate_keys:
+                continue
+            local_path = playlist_reference_path(final_path, source.path)
+            if local_path is None:
+                continue
+            size = safe_file_size(local_path)
+            if size is None:
+                continue
+            filename_key = filename_from_path(final_path).lower()
+            content_groups.setdefault((filename_key, size), []).append((record, final_path, local_path))
+        for group in content_groups.values():
+            if len(group) < 2:
+                continue
+            seen_hashes: dict[str, tuple[PlaylistRecord, str]] = {}
+            for record, final_path, local_path in group:
+                check_cancel(cancel_event)
+                digest = sha256_file(local_path, cancel_event)
+                if digest is None:
+                    continue
+                kept = seen_hashes.get(digest)
+                if kept is None:
+                    seen_hashes[digest] = (record, final_path)
+                    continue
+                kept_record, kept_final_path = kept
+                add_duplicate(
+                    duplicate_keys,
+                    source,
+                    record,
+                    final_path,
+                    kept_record,
+                    kept_final_path,
+                    (
+                        "Duplicate playlist entry in this playlist; file name, size, "
+                        f"and SHA-256 content match the first occurrence at {kept_record.reference}."
+                    ),
+                )
+    if duplicates:
+        log(f"Found {len(duplicates)} duplicate playlist entries to remove within individual playlists.")
+        mark_missing_entries_removed_by_playlist_dedupe(entries, duplicates)
+    return duplicates
+
+
+def mark_missing_entries_removed_by_playlist_dedupe(
+    entries: list[MissingEntry],
+    duplicates: list[PlaylistDuplicate],
+) -> None:
+    duplicate_ranges_by_source: dict[Path, list[PlaylistDuplicate]] = {}
+    for duplicate in duplicates:
+        duplicate_ranges_by_source.setdefault(duplicate.source_path, []).append(duplicate)
+    for entry in entries:
+        for duplicate in duplicate_ranges_by_source.get(entry.source_path, []):
+            if duplicate.edit_start <= entry.edit_start < duplicate.edit_end:
+                entry.action = duplicate.action
+                entry.match_status = duplicate.match_status
+                entry.new_path = duplicate.final_path
+                entry.reason = duplicate.reason
+                break
+
+
 def source_relative_path(source_path: Path, vdj_root: Path) -> Path:
     try:
         return source_path.resolve().relative_to(vdj_root.resolve())
@@ -840,35 +1094,49 @@ def replacement_text(entry: MissingEntry) -> str:
     return entry.new_path
 
 
-def apply_updates(
+def apply_changes(
     sources: list[SourceFile],
     entries: list[MissingEntry],
+    playlist_duplicates: list[PlaylistDuplicate],
     options: RunOptions,
     log: Callable[[str], None],
 ) -> tuple[Path | None, int]:
     updates = [entry for entry in entries if entry.action == "would_update"]
-    if not updates:
+    removals = [duplicate for duplicate in playlist_duplicates if duplicate.action == "would_remove_duplicate"]
+    if not updates and not removals:
         return None, 0
     backup_root = options.backup_dir / f"vdj-relocator-backup-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
     backup_root.mkdir(parents=True, exist_ok=True)
     source_map = {source.path: source for source in sources}
     changed_sources = 0
-    for source_path in sorted({entry.source_path for entry in updates}):
+    changed_paths = {entry.source_path for entry in updates} | {duplicate.source_path for duplicate in removals}
+    for source_path in sorted(changed_paths):
         source = source_map[source_path]
         relative = source_relative_path(source_path, options.vdj_root)
         backup_path = backup_root / relative
         backup_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_path, backup_path)
         source_entries = [entry for entry in updates if entry.source_path == source_path]
+        source_removals = [duplicate for duplicate in removals if duplicate.source_path == source_path]
+        operations: list[tuple[int, int, str]] = []
+        operations.extend((entry.edit_start, entry.edit_end, replacement_text(entry)) for entry in source_entries)
+        operations.extend((duplicate.edit_start, duplicate.edit_end, "") for duplicate in source_removals)
         text = source.text
-        for entry in sorted(source_entries, key=lambda item: item.edit_start, reverse=True):
-            text = text[: entry.edit_start] + replacement_text(entry) + text[entry.edit_end :]
+        for edit_start, edit_end, replacement in sorted(operations, key=lambda item: item[0], reverse=True):
+            text = text[:edit_start] + replacement + text[edit_end:]
         write_text(source_path, text, source.encoding)
         for entry in source_entries:
             entry.action = "updated"
             entry.reason = entry.reason.replace("Would update", "Updated")
+        for duplicate in source_removals:
+            duplicate.action = "removed_duplicate"
+        for entry in entries:
+            if entry.source_path != source_path or entry.action != "would_remove_duplicate":
+                continue
+            if any(duplicate.edit_start <= entry.edit_start < duplicate.edit_end for duplicate in source_removals):
+                entry.action = "removed_duplicate"
         changed_sources += 1
-    log(f"Applied updates to {changed_sources} source files.")
+    log(f"Applied changes to {changed_sources} source files.")
     return backup_root, changed_sources
 
 
@@ -890,7 +1158,7 @@ def report_columns() -> list[str]:
     ]
 
 
-def write_report(entries: list[MissingEntry], report_dir: Path) -> Path:
+def write_report(entries: list[MissingEntry], playlist_duplicates: list[PlaylistDuplicate], report_dir: Path) -> Path:
     report_dir.mkdir(parents=True, exist_ok=True)
     report_path = report_dir / f"vdj-relocator-report-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
     with report_path.open("w", newline="", encoding="utf-8-sig") as handle:
@@ -914,11 +1182,30 @@ def write_report(entries: list[MissingEntry], report_dir: Path) -> Path:
                     "candidates": " | ".join(entry.candidates),
                 }
             )
+        for duplicate in playlist_duplicates:
+            writer.writerow(
+                {
+                    "entry_id": f"playlist-duplicate-{duplicate.duplicate_id}",
+                    "source_kind": "playlist",
+                    "source_path": str(duplicate.source_path),
+                    "reference": duplicate.reference,
+                    "action": duplicate.action,
+                    "match_status": duplicate.match_status,
+                    "reason": duplicate.reason,
+                    "old_path": duplicate.old_path,
+                    "new_path": duplicate.final_path,
+                    "filename": duplicate.filename,
+                    "expected_size": "",
+                    "candidate_count": "",
+                    "candidates": f"kept: {duplicate.kept_path}",
+                }
+            )
     return report_path
 
 
 def summarize(
     entries: list[MissingEntry],
+    playlist_duplicates: list[PlaylistDuplicate],
     report_path: Path | None,
     backup_path: Path | None,
     sources_changed: int,
@@ -935,6 +1222,7 @@ def summarize(
         ambiguous=sum(1 for entry in entries if entry.match_status == "ambiguous"),
         not_found=sum(1 for entry in entries if entry.match_status == "not_found"),
         deduped=sum(1 for entry in entries if entry.match_status == "deduped_exact_duplicate"),
+        playlist_duplicates=len(playlist_duplicates),
         skipped=sum(1 for entry in entries if entry.action == "skipped"),
         sources_changed=sources_changed,
         search_engine=search_engine,
@@ -950,6 +1238,7 @@ def run_relocator(
 ) -> RunResult:
     sources: list[SourceFile] = []
     entries: list[MissingEntry] = []
+    playlist_duplicates: list[PlaylistDuplicate] = []
     report_path: Path | None = None
     backup_path: Path | None = None
     search_engine = "none"
@@ -965,17 +1254,19 @@ def run_relocator(
         check_cancel(cancel_event)
         resolve_matches(entries, index, options, log, cancel_event)
         check_cancel(cancel_event)
+        playlist_duplicates = plan_playlist_duplicate_removals(sources, entries, options, log, cancel_event)
+        check_cancel(cancel_event)
         if options.apply:
-            backup_path, sources_changed = apply_updates(sources, entries, options, log)
-        report_path = write_report(entries, options.report_dir)
+            backup_path, sources_changed = apply_changes(sources, entries, playlist_duplicates, options, log)
+        report_path = write_report(entries, playlist_duplicates, options.report_dir)
         log(f"Report written: {report_path}")
     except OperationCancelled:
         canceled = True
         log("Operation stopped by user.")
-        if entries:
-            report_path = write_report(entries, options.report_dir)
+        if entries or playlist_duplicates:
+            report_path = write_report(entries, playlist_duplicates, options.report_dir)
             log(f"Partial report written: {report_path}")
-    return summarize(entries, report_path, backup_path, sources_changed, search_engine, canceled, resumed)
+    return summarize(entries, playlist_duplicates, report_path, backup_path, sources_changed, search_engine, canceled, resumed)
 
 
 def format_result(result: RunResult) -> str:
@@ -987,7 +1278,8 @@ def format_result(result: RunResult) -> str:
         f"Skipped: {result.skipped}",
         f"Ambiguous: {result.ambiguous}",
         f"Not found: {result.not_found}",
-        f"Deduped exact duplicates: {result.deduped}",
+        f"Deduped candidate files: {result.deduped}",
+        f"Playlist duplicate rows: {result.playlist_duplicates}",
         f"Source files changed: {result.sources_changed}",
     ]
     if result.resumed:
@@ -1015,9 +1307,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--report-dir", type=Path, default=DEFAULT_REPORT_DIR, help=f"Report output folder. Default: {DEFAULT_REPORT_DIR}")
     parser.add_argument("--backup-dir", type=Path, default=DEFAULT_BACKUP_DIR, help=f"Backup output folder. Default: {DEFAULT_BACKUP_DIR}")
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR, help=f"Resume checkpoint folder. Default: {DEFAULT_STATE_DIR}")
-    parser.add_argument("--max-everything-results", type=int, default=1000, help="Per-filename result limit when using es.exe.")
+    parser.add_argument("--max-everything-results", type=int, default=1000000, help="Per-scan-folder result limit when using es.exe. Use 0 for no limit.")
     parser.add_argument("--no-resume", action="store_true", help="Ignore and do not write interrupted-scan checkpoints.")
-    parser.add_argument("--no-dedupe-exact", action="store_true", help="Do not consolidate byte-identical duplicate candidates; leave them ambiguous.")
+    parser.add_argument("--no-dedupe-exact", action="store_true", help="Do not consolidate byte-identical duplicate file candidates; leave them ambiguous.")
+    parser.add_argument("--no-playlist-dedupe", action="store_true", help="Do not remove duplicate song entries within each playlist.")
     parser.add_argument("--no-whitespace-fallback", action="store_true", help="Do not repair filename matches that only differ by extra or missing whitespace.")
     return parser
 
@@ -1035,6 +1328,7 @@ def options_from_args(args: argparse.Namespace) -> RunOptions:
         max_everything_results=args.max_everything_results,
         resume_scan=not args.no_resume,
         dedupe_exact_candidates=not args.no_dedupe_exact,
+        dedupe_playlist_entries=not args.no_playlist_dedupe,
         allow_whitespace_filename_fallback=not args.no_whitespace_fallback,
     )
 
@@ -1045,13 +1339,14 @@ def launch_gui() -> None:
 
     root = tk.Tk()
     root.title("VirtualDJ Playlist Helper")
-    root.geometry("880x660")
+    root.geometry("980x700")
 
     vdj_var = tk.StringVar(value=str(DEFAULT_VDJ_ROOT))
     search_mode_var = tk.StringVar(value="auto")
     include_database_var = tk.BooleanVar(value=True)
     resume_var = tk.BooleanVar(value=True)
     dedupe_var = tk.BooleanVar(value=True)
+    playlist_dedupe_var = tk.BooleanVar(value=True)
     whitespace_var = tk.BooleanVar(value=True)
     status_queue: queue.Queue[str] = queue.Queue()
     cancel_event = threading.Event()
@@ -1096,10 +1391,11 @@ def launch_gui() -> None:
 
     checks = ttk.Frame(main)
     checks.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(12, 0))
-    ttk.Checkbutton(checks, text="Include database.xml", variable=include_database_var).pack(side="left")
-    ttk.Checkbutton(checks, text="Resume interrupted scan", variable=resume_var).pack(side="left", padx=(18, 0))
-    ttk.Checkbutton(checks, text="Deduplicate exact matches", variable=dedupe_var).pack(side="left", padx=(18, 0))
-    ttk.Checkbutton(checks, text="Repair whitespace variants", variable=whitespace_var).pack(side="left", padx=(18, 0))
+    ttk.Checkbutton(checks, text="Include database.xml", variable=include_database_var).grid(row=0, column=0, sticky="w")
+    ttk.Checkbutton(checks, text="Resume interrupted scan", variable=resume_var).grid(row=0, column=1, sticky="w", padx=(18, 0))
+    ttk.Checkbutton(checks, text="Repair whitespace variants", variable=whitespace_var).grid(row=0, column=2, sticky="w", padx=(18, 0))
+    ttk.Checkbutton(checks, text="Resolve byte-identical candidates", variable=dedupe_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
+    ttk.Checkbutton(checks, text="Remove playlist duplicates", variable=playlist_dedupe_var).grid(row=1, column=1, sticky="w", padx=(18, 0), pady=(6, 0))
 
     mode_frame = ttk.Frame(main)
     mode_frame.grid(row=4, column=0, columnspan=3, sticky="w", pady=(12, 0))
@@ -1151,9 +1447,10 @@ def launch_gui() -> None:
             report_dir=DEFAULT_REPORT_DIR,
             backup_dir=DEFAULT_BACKUP_DIR,
             state_dir=DEFAULT_STATE_DIR,
-            max_everything_results=1000,
+            max_everything_results=1000000,
             resume_scan=resume_var.get(),
             dedupe_exact_candidates=dedupe_var.get(),
+            dedupe_playlist_entries=playlist_dedupe_var.get(),
             allow_whitespace_filename_fallback=whitespace_var.get(),
         )
 
