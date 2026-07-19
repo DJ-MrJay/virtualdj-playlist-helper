@@ -377,4 +377,4 @@ VirtualDJ still shows missing files after applying:
 
 ## License
 
-Add your preferred license before publishing this repository publicly.
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for the full text.
