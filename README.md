@@ -1,4 +1,4 @@
-# VirtualDJ Missing File Relocator
+# VirtualDJ Playlist Helper
 
 VirtualDJ can mark songs as missing when music files have been moved to a new drive or folder. The built-in **Relocate missing file** action works, but it opens Explorer and requires you to find each file manually. That becomes slow when hundreds or thousands of playlist entries point to old paths.
 

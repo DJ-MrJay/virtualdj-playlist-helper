@@ -1044,7 +1044,7 @@ def launch_gui() -> None:
     from tkinter import filedialog, messagebox, ttk
 
     root = tk.Tk()
-    root.title("VirtualDJ Missing File Relocator")
+    root.title("VirtualDJ Playlist Helper")
     root.geometry("880x660")
 
     vdj_var = tk.StringVar(value=str(DEFAULT_VDJ_ROOT))
