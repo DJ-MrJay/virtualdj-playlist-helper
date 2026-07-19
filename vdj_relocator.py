@@ -1,0 +1,1212 @@
+#!/usr/bin/env python3
+"""
+VirtualDJ missing-file relinker.
+
+Scans VirtualDJ playlists, virtual folders, and optionally database.xml for
+missing file paths, searches user-selected folders for safe filename matches,
+and writes a review report. Files are only edited when --apply is supplied.
+"""
+
+from __future__ import annotations
+
+import argparse
+import bisect
+import csv
+import dataclasses
+import datetime as dt
+import hashlib
+import html
+import json
+import ntpath
+import os
+from pathlib import Path
+import queue
+import re
+import shutil
+import subprocess
+import sys
+import threading
+from typing import Callable
+
+
+DEFAULT_VDJ_ROOT = Path.home() / "Documents" / "VirtualDJ"
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_REPORT_DIR = SCRIPT_DIR / "reports"
+DEFAULT_BACKUP_DIR = SCRIPT_DIR / "backups"
+DEFAULT_STATE_DIR = SCRIPT_DIR / "state"
+
+EXTVDJ_FILESIZE_RE = re.compile(r"<filesize>(\d+)</filesize>", re.IGNORECASE)
+ATTR_RE_TEMPLATE = r"\b{0}\s*=\s*(['\"])(.*?)\1"
+XML_TAG_RE = re.compile(r"<(?![!?/])[^>]+>", re.DOTALL)
+WHITESPACE_RE = re.compile(r"\s+")
+PATH_ATTRS = ("FilePath", "filepath", "File", "file", "Path", "path")
+SIZE_ATTRS = ("FileSize", "filesize", "Size", "size")
+
+
+@dataclasses.dataclass
+class SourceFile:
+    path: Path
+    kind: str
+    encoding: str
+    text: str
+
+
+@dataclasses.dataclass
+class MissingEntry:
+    entry_id: int
+    source_path: Path
+    source_kind: str
+    reference: str
+    old_path: str
+    filename: str
+    expected_size: int | None
+    edit_start: int
+    edit_end: int
+    edit_format: str
+    candidate_count: int = 0
+    candidates: list[str] = dataclasses.field(default_factory=list)
+    new_path: str = ""
+    match_status: str = "not_checked"
+    action: str = "skipped"
+    reason: str = ""
+
+
+@dataclasses.dataclass
+class RunOptions:
+    vdj_root: Path
+    scan_roots: list[Path]
+    include_database: bool
+    apply: bool
+    search_mode: str
+    report_dir: Path
+    backup_dir: Path
+    state_dir: Path
+    max_everything_results: int
+    resume_scan: bool
+    dedupe_exact_candidates: bool
+    allow_whitespace_filename_fallback: bool
+
+
+@dataclasses.dataclass
+class RunResult:
+    report_path: Path | None
+    backup_path: Path | None
+    total_missing: int
+    would_update: int
+    updated: int
+    ambiguous: int
+    not_found: int
+    deduped: int
+    skipped: int
+    sources_changed: int
+    search_engine: str
+    canceled: bool = False
+    resumed: bool = False
+
+
+@dataclasses.dataclass
+class SearchCheckpoint:
+    fingerprint: str
+    search_engine: str
+    index: dict[str, list[str]] = dataclasses.field(default_factory=dict)
+    completed_roots: set[str] = dataclasses.field(default_factory=set)
+    pending_root: str = ""
+    pending_stack: list[str] = dataclasses.field(default_factory=list)
+    scanned_files: int = 0
+    result_count: int = 0
+    resumed: bool = False
+
+
+class OperationCancelled(Exception):
+    pass
+
+
+def log_noop(message: str) -> None:
+    _ = message
+
+
+def check_cancel(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise OperationCancelled
+
+
+def detect_text_encoding(path: Path) -> tuple[str, str]:
+    data = path.read_bytes()
+    if data.startswith(b"\xef\xbb\xbf"):
+        return data.decode("utf-8-sig"), "utf-8-sig"
+    if data.startswith(b"\xff\xfe") or data.startswith(b"\xfe\xff"):
+        return data.decode("utf-16"), "utf-16"
+    try:
+        return data.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        return data.decode("cp1252"), "cp1252"
+
+
+def write_text(path: Path, text: str, encoding: str) -> None:
+    with path.open("w", encoding=encoding, newline="") as handle:
+        handle.write(text)
+
+
+def line_content_and_newline(line: str) -> tuple[str, str]:
+    if line.endswith("\r\n"):
+        return line[:-2], "\r\n"
+    if line.endswith("\n") or line.endswith("\r"):
+        return line[:-1], line[-1]
+    return line, ""
+
+
+def line_offsets(text: str) -> list[int]:
+    offsets = [0]
+    for match in re.finditer(r"\n", text):
+        offsets.append(match.end())
+    return offsets
+
+
+def line_number_from_offset(offsets: list[int], offset: int) -> int:
+    return bisect.bisect_right(offsets, offset)
+
+
+def normalize_for_compare(path: str | Path) -> str:
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def is_url(value: str) -> bool:
+    return bool(re.match(r"^[a-z][a-z0-9+.-]*://", value, re.IGNORECASE))
+
+
+def is_windows_absolute(path_value: str) -> bool:
+    if path_value.startswith("\\\\"):
+        return True
+    drive, _ = ntpath.splitdrive(path_value)
+    return bool(drive)
+
+
+class PathExistenceCache:
+    def __init__(self) -> None:
+        self._cache: dict[tuple[str, str, str], bool] = {}
+
+    def exists(self, path_value: str, source_path: Path) -> bool:
+        if not path_value or is_url(path_value):
+            return True
+        expanded = os.path.expandvars(path_value.strip().strip('"'))
+        if is_windows_absolute(expanded):
+            key = ("absolute", "", ntpath.normcase(expanded))
+            check_path = Path(expanded)
+        else:
+            source_parent = normalize_for_compare(source_path.parent)
+            key = ("relative", source_parent, expanded)
+            check_path = source_path.parent / expanded
+        if key not in self._cache:
+            self._cache[key] = check_path.exists()
+        return self._cache[key]
+
+
+def filename_from_path(path_value: str) -> str:
+    cleaned = path_value.strip().strip('"')
+    return ntpath.basename(cleaned.replace("/", "\\"))
+
+
+def normalize_filename_for_match(filename: str) -> str:
+    stem, ext = ntpath.splitext(filename)
+    stem = WHITESPACE_RE.sub(" ", stem).strip()
+    ext = ext.strip()
+    return f"{stem}{ext}".lower()
+
+
+def normalized_display_filename(filename: str) -> str:
+    stem, ext = ntpath.splitext(filename)
+    stem = WHITESPACE_RE.sub(" ", stem).strip()
+    ext = ext.strip()
+    return f"{stem}{ext}"
+
+
+def normalize_path_component_for_match(value: str) -> str:
+    return WHITESPACE_RE.sub(" ", value).strip().lower()
+
+
+def parent_folder_name(path_value: str) -> str:
+    cleaned = path_value.strip().strip('"').replace("/", "\\").rstrip("\\")
+    return ntpath.basename(ntpath.dirname(cleaned))
+
+
+def exact_filename_key(filename: str) -> str:
+    return f"exact:{filename.lower()}"
+
+
+def normalized_filename_key(filename: str) -> str:
+    return f"normalized:{normalize_filename_for_match(filename)}"
+
+
+def attr_match(tag: str, attr_name: str) -> re.Match[str] | None:
+    return re.search(ATTR_RE_TEMPLATE.format(re.escape(attr_name)), tag, re.IGNORECASE | re.DOTALL)
+
+
+def attr_value_span(tag_start: int, match: re.Match[str]) -> tuple[int, int]:
+    return tag_start + match.start(2), tag_start + match.end(2)
+
+
+def parse_int(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value.strip())
+    except ValueError:
+        return None
+
+
+def load_source(path: Path, kind: str) -> SourceFile:
+    text, encoding = detect_text_encoding(path)
+    return SourceFile(path=path, kind=kind, encoding=encoding, text=text)
+
+
+def discover_sources(vdj_root: Path, include_database: bool, log: Callable[[str], None]) -> list[SourceFile]:
+    sources: list[SourceFile] = []
+    playlists = vdj_root / "Playlists"
+    if playlists.exists():
+        for pattern in ("*.m3u", "*.m3u8"):
+            for path in sorted(playlists.glob(pattern)):
+                sources.append(load_source(path, "playlist"))
+    folders = vdj_root / "Folders"
+    if folders.exists():
+        for path in sorted(folders.rglob("*.vdjfolder")):
+            sources.append(load_source(path, "virtual_folder"))
+    database = vdj_root / "database.xml"
+    if include_database and database.exists():
+        sources.append(load_source(database, "database"))
+    log(f"Loaded {len(sources)} VirtualDJ source files.")
+    return sources
+
+
+def parse_m3u(source: SourceFile, existence_cache: PathExistenceCache, start_id: int) -> list[MissingEntry]:
+    entries: list[MissingEntry] = []
+    offset = 0
+    pending_size: int | None = None
+    entry_id = start_id
+    for line_number, raw_line in enumerate(source.text.splitlines(keepends=True), start=1):
+        content, _newline = line_content_and_newline(raw_line)
+        stripped = content.strip()
+        if stripped.startswith("#EXTVDJ"):
+            size_match = EXTVDJ_FILESIZE_RE.search(stripped)
+            pending_size = parse_int(size_match.group(1)) if size_match else None
+        elif stripped.startswith("#") or not stripped:
+            pass
+        else:
+            path_value = content
+            filename = filename_from_path(path_value)
+            if filename and not existence_cache.exists(path_value, source.path):
+                entries.append(
+                    MissingEntry(
+                        entry_id=entry_id,
+                        source_path=source.path,
+                        source_kind=source.kind,
+                        reference=f"line {line_number}",
+                        old_path=path_value,
+                        filename=filename,
+                        expected_size=pending_size,
+                        edit_start=offset,
+                        edit_end=offset + len(content),
+                        edit_format="plain",
+                    )
+                )
+                entry_id += 1
+            pending_size = None
+        offset += len(raw_line)
+    return entries
+
+
+def parse_xml_path_attrs(source: SourceFile, existence_cache: PathExistenceCache, start_id: int) -> list[MissingEntry]:
+    entries: list[MissingEntry] = []
+    offsets = line_offsets(source.text)
+    entry_id = start_id
+    for index, tag_match in enumerate(XML_TAG_RE.finditer(source.text), start=1):
+        tag = tag_match.group(0)
+        path_match: re.Match[str] | None = None
+        for path_attr in PATH_ATTRS:
+            path_match = attr_match(tag, path_attr)
+            if path_match:
+                break
+        if not path_match:
+            continue
+        path_value = html.unescape(path_match.group(2))
+        filename = filename_from_path(path_value)
+        if not filename or existence_cache.exists(path_value, source.path):
+            continue
+        expected_size: int | None = None
+        for size_attr in SIZE_ATTRS:
+            size_match = attr_match(tag, size_attr)
+            if size_match:
+                expected_size = parse_int(size_match.group(2))
+                break
+        edit_start, edit_end = attr_value_span(tag_match.start(), path_match)
+        line_number = line_number_from_offset(offsets, tag_match.start())
+        entries.append(
+            MissingEntry(
+                entry_id=entry_id,
+                source_path=source.path,
+                source_kind=source.kind,
+                reference=f"tag {index}, line {line_number}",
+                old_path=path_value,
+                filename=filename,
+                expected_size=expected_size,
+                edit_start=edit_start,
+                edit_end=edit_end,
+                edit_format="xml_attr",
+            )
+        )
+        entry_id += 1
+    return entries
+
+
+def parse_sources(sources: list[SourceFile], log: Callable[[str], None]) -> list[MissingEntry]:
+    existence_cache = PathExistenceCache()
+    entries: list[MissingEntry] = []
+    next_id = 1
+    for source in sources:
+        if source.kind == "playlist":
+            parsed = parse_m3u(source, existence_cache, next_id)
+        else:
+            parsed = parse_xml_path_attrs(source, existence_cache, next_id)
+        entries.extend(parsed)
+        next_id += len(parsed)
+    log(f"Found {len(entries)} missing VirtualDJ references.")
+    return entries
+
+
+def checkpoint_file(state_dir: Path) -> Path:
+    return state_dir / "vdj-relocator-scan-checkpoint.json"
+
+
+def checkpoint_to_json(checkpoint: SearchCheckpoint) -> dict[str, object]:
+    return {
+        "fingerprint": checkpoint.fingerprint,
+        "search_engine": checkpoint.search_engine,
+        "index": checkpoint.index,
+        "completed_roots": sorted(checkpoint.completed_roots),
+        "pending_root": checkpoint.pending_root,
+        "pending_stack": checkpoint.pending_stack,
+        "scanned_files": checkpoint.scanned_files,
+        "result_count": checkpoint.result_count,
+    }
+
+
+def checkpoint_from_json(data: dict[str, object]) -> SearchCheckpoint:
+    raw_index = data.get("index", {})
+    index: dict[str, list[str]] = {}
+    if isinstance(raw_index, dict):
+        for key, value in raw_index.items():
+            if isinstance(key, str) and isinstance(value, list):
+                index[key] = [str(item) for item in value]
+    raw_completed = data.get("completed_roots", [])
+    completed = {str(item) for item in raw_completed} if isinstance(raw_completed, list) else set()
+    raw_stack = data.get("pending_stack", [])
+    stack = [str(item) for item in raw_stack] if isinstance(raw_stack, list) else []
+    return SearchCheckpoint(
+        fingerprint=str(data.get("fingerprint", "")),
+        search_engine=str(data.get("search_engine", "")),
+        index=index,
+        completed_roots=completed,
+        pending_root=str(data.get("pending_root", "")),
+        pending_stack=stack,
+        scanned_files=int(data.get("scanned_files", 0) or 0),
+        result_count=int(data.get("result_count", 0) or 0),
+        resumed=True,
+    )
+
+
+def save_checkpoint(state_dir: Path, checkpoint: SearchCheckpoint) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_file(state_dir).write_text(json.dumps(checkpoint_to_json(checkpoint), indent=2), encoding="utf-8")
+
+
+def load_checkpoint(state_dir: Path, fingerprint: str, search_engine: str) -> SearchCheckpoint | None:
+    path = checkpoint_file(state_dir)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    checkpoint = checkpoint_from_json(data)
+    if checkpoint.fingerprint != fingerprint or checkpoint.search_engine != search_engine:
+        return None
+    return checkpoint
+
+
+def clear_checkpoint(state_dir: Path) -> None:
+    path = checkpoint_file(state_dir)
+    if path.exists():
+        path.unlink()
+
+
+def wanted_filename_sets(entries: list[MissingEntry], allow_whitespace: bool) -> tuple[set[str], set[str]]:
+    exact = {exact_filename_key(entry.filename) for entry in entries}
+    normalized: set[str] = set()
+    if allow_whitespace:
+        normalized = {normalized_filename_key(entry.filename) for entry in entries}
+    return exact, normalized
+
+
+def scan_fingerprint(entries: list[MissingEntry], options: RunOptions, search_engine: str) -> str:
+    payload = {
+        "search_engine": search_engine,
+        "scan_roots": [normalize_for_compare(root) for root in options.scan_roots],
+        "filenames": sorted({entry.filename.lower() for entry in entries}),
+        "allow_whitespace": options.allow_whitespace_filename_fallback,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def add_index_candidate(index: dict[str, list[str]], key: str, path: str) -> None:
+    values = index.setdefault(key, [])
+    norm = normalize_for_compare(path)
+    if all(normalize_for_compare(existing) != norm for existing in values):
+        values.append(path)
+
+
+def file_is_under_root(path: str | Path, root: str | Path) -> bool:
+    path_norm = normalize_for_compare(path)
+    root_norm = normalize_for_compare(root)
+    return path_norm == root_norm or path_norm.startswith(root_norm.rstrip("\\/") + os.sep)
+
+
+def index_candidate_path(index: dict[str, list[str]], path: str, exact_wanted: set[str], normalized_wanted: set[str]) -> bool:
+    name = ntpath.basename(path.replace("/", "\\"))
+    found = False
+    exact_key = exact_filename_key(name)
+    normalized_key = normalized_filename_key(name)
+    if exact_key in exact_wanted:
+        add_index_candidate(index, exact_key, path)
+        found = True
+    if normalized_key in normalized_wanted:
+        add_index_candidate(index, normalized_key, path)
+        found = True
+    return found
+
+
+def find_es_executable() -> str | None:
+    found = shutil.which("es.exe") or shutil.which("es")
+    if found:
+        return found
+    candidates = [
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Everything" / "es.exe",
+        Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Everything" / "es.exe",
+        SCRIPT_DIR / "es.exe",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def everything_queries(entries: list[MissingEntry], allow_whitespace: bool) -> list[str]:
+    queries = {entry.filename for entry in entries}
+    if allow_whitespace:
+        queries.update(normalized_display_filename(entry.filename) for entry in entries)
+    return sorted(query for query in queries if query)
+
+
+def build_index_everything(
+    entries: list[MissingEntry],
+    options: RunOptions,
+    log: Callable[[str], None],
+    cancel_event: threading.Event | None,
+) -> tuple[dict[str, list[str]], bool]:
+    es = find_es_executable()
+    if not es:
+        raise RuntimeError("es.exe was not found")
+    exact_wanted, normalized_wanted = wanted_filename_sets(entries, options.allow_whitespace_filename_fallback)
+    fingerprint = scan_fingerprint(entries, options, "everything")
+    checkpoint = load_checkpoint(options.state_dir, fingerprint, "everything") if options.resume_scan else None
+    if checkpoint:
+        log("Resuming Everything search checkpoint.")
+    else:
+        checkpoint = SearchCheckpoint(fingerprint=fingerprint, search_engine="everything")
+    queries = everything_queries(entries, options.allow_whitespace_filename_fallback)
+    for root in options.scan_roots:
+        root_text = str(root)
+        root_key = normalize_for_compare(root)
+        if root_key in checkpoint.completed_roots:
+            continue
+        check_cancel(cancel_event)
+        log(f"Searching Everything index under {root_text}...")
+        for query_text in queries:
+            check_cancel(cancel_event)
+            command = [
+                es,
+                "-path",
+                root_text,
+                "-full-path-and-name",
+                "-n",
+                str(options.max_everything_results),
+                query_text,
+            ]
+            completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            if completed.returncode not in (0, 1):
+                raise RuntimeError(completed.stderr.strip() or f"es.exe failed with exit code {completed.returncode}")
+            for line in completed.stdout.splitlines():
+                candidate = line.strip()
+                if not candidate or not file_is_under_root(candidate, root):
+                    continue
+                if index_candidate_path(checkpoint.index, candidate, exact_wanted, normalized_wanted):
+                    checkpoint.result_count += 1
+        checkpoint.completed_roots.add(root_key)
+        if options.resume_scan:
+            save_checkpoint(options.state_dir, checkpoint)
+    if options.resume_scan:
+        clear_checkpoint(options.state_dir)
+    return checkpoint.index, checkpoint.resumed
+
+
+def build_index_by_scan(
+    entries: list[MissingEntry],
+    options: RunOptions,
+    log: Callable[[str], None],
+    cancel_event: threading.Event | None,
+) -> tuple[dict[str, list[str]], bool]:
+    exact_wanted, normalized_wanted = wanted_filename_sets(entries, options.allow_whitespace_filename_fallback)
+    fingerprint = scan_fingerprint(entries, options, "scan")
+    checkpoint = load_checkpoint(options.state_dir, fingerprint, "scan") if options.resume_scan else None
+    if checkpoint:
+        log("Resuming direct scan checkpoint.")
+    else:
+        checkpoint = SearchCheckpoint(fingerprint=fingerprint, search_engine="scan")
+    for root in options.scan_roots:
+        root_key = normalize_for_compare(root)
+        if root_key in checkpoint.completed_roots:
+            continue
+        if checkpoint.pending_root == root_key and checkpoint.pending_stack:
+            stack = [Path(item) for item in checkpoint.pending_stack]
+        else:
+            stack = [root]
+            checkpoint.pending_root = root_key
+        log(f"Scanning folder {root}...")
+        save_counter = 0
+        while stack:
+            check_cancel(cancel_event)
+            current = stack.pop()
+            try:
+                with os.scandir(current) as iterator:
+                    for item in iterator:
+                        check_cancel(cancel_event)
+                        try:
+                            if item.is_dir(follow_symlinks=False):
+                                stack.append(Path(item.path))
+                            elif item.is_file(follow_symlinks=False):
+                                checkpoint.scanned_files += 1
+                                if index_candidate_path(checkpoint.index, item.path, exact_wanted, normalized_wanted):
+                                    checkpoint.result_count += 1
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+            save_counter += 1
+            if options.resume_scan and save_counter >= 100:
+                checkpoint.pending_stack = [str(item) for item in stack]
+                save_checkpoint(options.state_dir, checkpoint)
+                save_counter = 0
+        checkpoint.pending_root = ""
+        checkpoint.pending_stack = []
+        checkpoint.completed_roots.add(root_key)
+        if options.resume_scan:
+            save_checkpoint(options.state_dir, checkpoint)
+    if options.resume_scan:
+        clear_checkpoint(options.state_dir)
+    log(f"Scanned {checkpoint.scanned_files} files and found {checkpoint.result_count} candidate hits.")
+    return checkpoint.index, checkpoint.resumed
+
+
+def build_search_index(
+    entries: list[MissingEntry],
+    options: RunOptions,
+    log: Callable[[str], None],
+    cancel_event: threading.Event | None,
+) -> tuple[dict[str, list[str]], str, bool]:
+    if not entries:
+        return {}, "none", False
+    if options.search_mode == "scan":
+        index, resumed = build_index_by_scan(entries, options, log, cancel_event)
+        return index, "scan", resumed
+    if options.search_mode == "everything":
+        index, resumed = build_index_everything(entries, options, log, cancel_event)
+        return index, "everything", resumed
+    try:
+        index, resumed = build_index_everything(entries, options, log, cancel_event)
+        return index, "everything", resumed
+    except Exception as exc:
+        log(f"Everything search unavailable ({exc}); falling back to direct folder scan.")
+        index, resumed = build_index_by_scan(entries, options, log, cancel_event)
+        return index, "scan", resumed
+
+
+def safe_file_size(path: str | Path) -> int | None:
+    try:
+        return Path(path).stat().st_size
+    except OSError:
+        return None
+
+
+def sha256_file(path: str | Path, cancel_event: threading.Event | None) -> str | None:
+    digest = hashlib.sha256()
+    try:
+        with Path(path).open("rb") as handle:
+            while True:
+                check_cancel(cancel_event)
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def candidate_sort_key(path: str, scan_roots: list[Path]) -> tuple[int, int, str]:
+    priority = len(scan_roots)
+    for index, root in enumerate(scan_roots):
+        if file_is_under_root(path, root):
+            priority = index
+            break
+    return priority, len(path), path.lower()
+
+
+def canonical_candidate(paths: list[str], scan_roots: list[Path]) -> str:
+    return sorted(paths, key=lambda item: candidate_sort_key(item, scan_roots))[0]
+
+
+def dedupe_exact_candidates(
+    candidates: list[str],
+    scan_roots: list[Path],
+    cancel_event: threading.Event | None,
+) -> str | None:
+    if len(candidates) < 2:
+        return None
+    sizes: dict[int, list[str]] = {}
+    for candidate in candidates:
+        size = safe_file_size(candidate)
+        if size is None:
+            return None
+        sizes.setdefault(size, []).append(candidate)
+    if len(sizes) != 1:
+        return None
+    hashes: dict[str, list[str]] = {}
+    for candidate in candidates:
+        digest = sha256_file(candidate, cancel_event)
+        if digest is None:
+            return None
+        hashes.setdefault(digest, []).append(candidate)
+    if len(hashes) != 1:
+        return None
+    return canonical_candidate(candidates, scan_roots)
+
+
+def unique_existing_candidates(candidates: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for candidate in candidates:
+        norm = normalize_for_compare(candidate)
+        if norm in seen:
+            continue
+        if not Path(candidate).exists():
+            continue
+        seen.add(norm)
+        result.append(candidate)
+    return result
+
+
+def parent_context_candidate(entry: MissingEntry, candidates: list[str]) -> str | None:
+    old_parent = normalize_path_component_for_match(parent_folder_name(entry.old_path))
+    if not old_parent:
+        return None
+    matches = [
+        candidate
+        for candidate in candidates
+        if normalize_path_component_for_match(parent_folder_name(candidate)) == old_parent
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def mark_update(entry: MissingEntry, candidate: str, status: str, reason: str) -> None:
+    entry.new_path = candidate
+    entry.match_status = status
+    entry.action = "would_update"
+    entry.reason = reason
+
+
+def mark_skip(entry: MissingEntry, status: str, reason: str) -> None:
+    entry.new_path = ""
+    entry.match_status = status
+    entry.action = "skipped"
+    entry.reason = reason
+
+
+def resolve_candidates(
+    entry: MissingEntry,
+    candidates: list[str],
+    match_kind: str,
+    options: RunOptions,
+    cancel_event: threading.Event | None,
+) -> None:
+    candidates = unique_existing_candidates(candidates)
+    entry.candidates = sorted(candidates, key=lambda item: item.lower())
+    entry.candidate_count = len(candidates)
+    if not candidates:
+        mark_skip(entry, "not_found", "No matching file was found in the selected scan folders.")
+        return
+
+    prefix = "matched_by_exact_filename" if match_kind == "exact" else "matched_by_normalized_filename"
+    if entry.expected_size is not None:
+        size_matches = [candidate for candidate in candidates if safe_file_size(candidate) == entry.expected_size]
+        if len(size_matches) == 1:
+            mark_update(entry, size_matches[0], f"{prefix}_and_size", "Filename and stored file size match.")
+            return
+        if len(size_matches) > 1:
+            if options.dedupe_exact_candidates:
+                deduped = dedupe_exact_candidates(size_matches, options.scan_roots, cancel_event)
+                if deduped:
+                    mark_update(entry, deduped, "deduped_exact_duplicate", "Multiple candidates are byte-identical; selected canonical path.")
+                    return
+            mark_skip(entry, "ambiguous", "Multiple candidates match the stored file size.")
+            return
+        if match_kind == "normalized":
+            parent_candidate = parent_context_candidate(entry, candidates)
+            if parent_candidate:
+                mark_update(
+                    entry,
+                    parent_candidate,
+                    "matched_by_normalized_filename_and_parent_size_mismatch",
+                    "Whitespace-normalized filename and parent folder match, but stored file size differs.",
+                )
+                return
+        mark_skip(entry, "size_mismatch", "Filename exists, but no candidate matches VirtualDJ's stored file size.")
+        return
+
+    if len(candidates) == 1:
+        mark_update(entry, candidates[0], prefix, "Exactly one filename candidate was found.")
+        return
+    if options.dedupe_exact_candidates:
+        deduped = dedupe_exact_candidates(candidates, options.scan_roots, cancel_event)
+        if deduped:
+            mark_update(entry, deduped, "deduped_exact_duplicate", "Multiple candidates are byte-identical; selected canonical path.")
+            return
+    if match_kind == "normalized":
+        parent_candidate = parent_context_candidate(entry, candidates)
+        if parent_candidate:
+            mark_update(
+                entry,
+                parent_candidate,
+                "matched_by_normalized_filename_and_parent",
+                "Whitespace-normalized filename and parent folder identify one candidate.",
+            )
+            return
+    mark_skip(entry, "ambiguous", "Multiple candidates were found and none could be selected safely.")
+
+
+def resolve_matches(
+    entries: list[MissingEntry],
+    index: dict[str, list[str]],
+    options: RunOptions,
+    log: Callable[[str], None],
+    cancel_event: threading.Event | None,
+) -> None:
+    for entry in entries:
+        check_cancel(cancel_event)
+        exact_candidates = index.get(exact_filename_key(entry.filename), [])
+        if exact_candidates:
+            resolve_candidates(entry, exact_candidates, "exact", options, cancel_event)
+            continue
+        if options.allow_whitespace_filename_fallback:
+            normalized_candidates = index.get(normalized_filename_key(entry.filename), [])
+            if normalized_candidates:
+                resolve_candidates(entry, normalized_candidates, "normalized", options, cancel_event)
+                continue
+        mark_skip(entry, "not_found", "No matching file was found in the selected scan folders.")
+    log("Resolved candidate matches.")
+
+
+def source_relative_path(source_path: Path, vdj_root: Path) -> Path:
+    try:
+        return source_path.resolve().relative_to(vdj_root.resolve())
+    except ValueError:
+        return Path(source_path.name)
+
+
+def replacement_text(entry: MissingEntry) -> str:
+    if entry.edit_format == "xml_attr":
+        return html.escape(entry.new_path, quote=True)
+    return entry.new_path
+
+
+def apply_updates(
+    sources: list[SourceFile],
+    entries: list[MissingEntry],
+    options: RunOptions,
+    log: Callable[[str], None],
+) -> tuple[Path | None, int]:
+    updates = [entry for entry in entries if entry.action == "would_update"]
+    if not updates:
+        return None, 0
+    backup_root = options.backup_dir / f"vdj-relocator-backup-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    backup_root.mkdir(parents=True, exist_ok=True)
+    source_map = {source.path: source for source in sources}
+    changed_sources = 0
+    for source_path in sorted({entry.source_path for entry in updates}):
+        source = source_map[source_path]
+        relative = source_relative_path(source_path, options.vdj_root)
+        backup_path = backup_root / relative
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, backup_path)
+        source_entries = [entry for entry in updates if entry.source_path == source_path]
+        text = source.text
+        for entry in sorted(source_entries, key=lambda item: item.edit_start, reverse=True):
+            text = text[: entry.edit_start] + replacement_text(entry) + text[entry.edit_end :]
+        write_text(source_path, text, source.encoding)
+        for entry in source_entries:
+            entry.action = "updated"
+            entry.reason = entry.reason.replace("Would update", "Updated")
+        changed_sources += 1
+    log(f"Applied updates to {changed_sources} source files.")
+    return backup_root, changed_sources
+
+
+def report_columns() -> list[str]:
+    return [
+        "entry_id",
+        "source_kind",
+        "source_path",
+        "reference",
+        "action",
+        "match_status",
+        "reason",
+        "old_path",
+        "new_path",
+        "filename",
+        "expected_size",
+        "candidate_count",
+        "candidates",
+    ]
+
+
+def write_report(entries: list[MissingEntry], report_dir: Path) -> Path:
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / f"vdj-relocator-report-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
+    with report_path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=report_columns())
+        writer.writeheader()
+        for entry in entries:
+            writer.writerow(
+                {
+                    "entry_id": entry.entry_id,
+                    "source_kind": entry.source_kind,
+                    "source_path": str(entry.source_path),
+                    "reference": entry.reference,
+                    "action": entry.action,
+                    "match_status": entry.match_status,
+                    "reason": entry.reason,
+                    "old_path": entry.old_path,
+                    "new_path": entry.new_path,
+                    "filename": entry.filename,
+                    "expected_size": entry.expected_size or "",
+                    "candidate_count": entry.candidate_count,
+                    "candidates": " | ".join(entry.candidates),
+                }
+            )
+    return report_path
+
+
+def summarize(
+    entries: list[MissingEntry],
+    report_path: Path | None,
+    backup_path: Path | None,
+    sources_changed: int,
+    search_engine: str,
+    canceled: bool,
+    resumed: bool,
+) -> RunResult:
+    return RunResult(
+        report_path=report_path,
+        backup_path=backup_path,
+        total_missing=len(entries),
+        would_update=sum(1 for entry in entries if entry.action == "would_update"),
+        updated=sum(1 for entry in entries if entry.action == "updated"),
+        ambiguous=sum(1 for entry in entries if entry.match_status == "ambiguous"),
+        not_found=sum(1 for entry in entries if entry.match_status == "not_found"),
+        deduped=sum(1 for entry in entries if entry.match_status == "deduped_exact_duplicate"),
+        skipped=sum(1 for entry in entries if entry.action == "skipped"),
+        sources_changed=sources_changed,
+        search_engine=search_engine,
+        canceled=canceled,
+        resumed=resumed,
+    )
+
+
+def run_relocator(
+    options: RunOptions,
+    log: Callable[[str], None] = log_noop,
+    cancel_event: threading.Event | None = None,
+) -> RunResult:
+    sources: list[SourceFile] = []
+    entries: list[MissingEntry] = []
+    report_path: Path | None = None
+    backup_path: Path | None = None
+    search_engine = "none"
+    resumed = False
+    sources_changed = 0
+    canceled = False
+    try:
+        check_cancel(cancel_event)
+        sources = discover_sources(options.vdj_root, options.include_database, log)
+        entries = parse_sources(sources, log)
+        check_cancel(cancel_event)
+        index, search_engine, resumed = build_search_index(entries, options, log, cancel_event)
+        check_cancel(cancel_event)
+        resolve_matches(entries, index, options, log, cancel_event)
+        check_cancel(cancel_event)
+        if options.apply:
+            backup_path, sources_changed = apply_updates(sources, entries, options, log)
+        report_path = write_report(entries, options.report_dir)
+        log(f"Report written: {report_path}")
+    except OperationCancelled:
+        canceled = True
+        log("Operation stopped by user.")
+        if entries:
+            report_path = write_report(entries, options.report_dir)
+            log(f"Partial report written: {report_path}")
+    return summarize(entries, report_path, backup_path, sources_changed, search_engine, canceled, resumed)
+
+
+def format_result(result: RunResult) -> str:
+    lines = [
+        f"Search engine: {result.search_engine}",
+        f"Missing references: {result.total_missing}",
+        f"Would update: {result.would_update}",
+        f"Updated: {result.updated}",
+        f"Skipped: {result.skipped}",
+        f"Ambiguous: {result.ambiguous}",
+        f"Not found: {result.not_found}",
+        f"Deduped exact duplicates: {result.deduped}",
+        f"Source files changed: {result.sources_changed}",
+    ]
+    if result.resumed:
+        lines.append("Resumed from checkpoint: yes")
+    if result.canceled:
+        lines.append("Canceled: yes")
+    if result.report_path:
+        lines.append(f"Report: {result.report_path}")
+    if result.backup_path:
+        lines.append(f"Backup: {result.backup_path}")
+    return "\n".join(lines)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Relink missing VirtualDJ playlist/folder/database paths by exact filename match."
+    )
+    parser.add_argument("--gui", action="store_true", help="Launch the folder-picker GUI.")
+    parser.add_argument("--no-gui", action="store_true", help="Do not launch the GUI when scan roots are omitted.")
+    parser.add_argument("--vdj-root", type=Path, default=DEFAULT_VDJ_ROOT, help=f"VirtualDJ folder. Default: {DEFAULT_VDJ_ROOT}")
+    parser.add_argument("--scan-root", type=Path, action="append", default=[], help="Folder to search for relocated music. May be supplied multiple times.")
+    parser.add_argument("--apply", action="store_true", help="Write confirmed replacements. Without this, only a report is written.")
+    parser.add_argument("--no-database", action="store_true", help="Do not scan/update database.xml; only playlists and .vdjfolder files are checked.")
+    parser.add_argument("--search-mode", choices=("auto", "scan", "everything"), default="auto", help="auto uses Everything CLI if es.exe exists, otherwise scans selected folders.")
+    parser.add_argument("--report-dir", type=Path, default=DEFAULT_REPORT_DIR, help=f"Report output folder. Default: {DEFAULT_REPORT_DIR}")
+    parser.add_argument("--backup-dir", type=Path, default=DEFAULT_BACKUP_DIR, help=f"Backup output folder. Default: {DEFAULT_BACKUP_DIR}")
+    parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR, help=f"Resume checkpoint folder. Default: {DEFAULT_STATE_DIR}")
+    parser.add_argument("--max-everything-results", type=int, default=1000, help="Per-filename result limit when using es.exe.")
+    parser.add_argument("--no-resume", action="store_true", help="Ignore and do not write interrupted-scan checkpoints.")
+    parser.add_argument("--no-dedupe-exact", action="store_true", help="Do not consolidate byte-identical duplicate candidates; leave them ambiguous.")
+    parser.add_argument("--no-whitespace-fallback", action="store_true", help="Do not repair filename matches that only differ by extra or missing whitespace.")
+    return parser
+
+
+def options_from_args(args: argparse.Namespace) -> RunOptions:
+    return RunOptions(
+        vdj_root=args.vdj_root,
+        scan_roots=args.scan_root,
+        include_database=not args.no_database,
+        apply=args.apply,
+        search_mode=args.search_mode,
+        report_dir=args.report_dir,
+        backup_dir=args.backup_dir,
+        state_dir=args.state_dir,
+        max_everything_results=args.max_everything_results,
+        resume_scan=not args.no_resume,
+        dedupe_exact_candidates=not args.no_dedupe_exact,
+        allow_whitespace_filename_fallback=not args.no_whitespace_fallback,
+    )
+
+
+def launch_gui() -> None:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+
+    root = tk.Tk()
+    root.title("VirtualDJ Missing File Relocator")
+    root.geometry("880x660")
+
+    vdj_var = tk.StringVar(value=str(DEFAULT_VDJ_ROOT))
+    search_mode_var = tk.StringVar(value="auto")
+    include_database_var = tk.BooleanVar(value=True)
+    resume_var = tk.BooleanVar(value=True)
+    dedupe_var = tk.BooleanVar(value=True)
+    whitespace_var = tk.BooleanVar(value=True)
+    status_queue: queue.Queue[str] = queue.Queue()
+    cancel_event = threading.Event()
+    worker: threading.Thread | None = None
+
+    main = ttk.Frame(root, padding=12)
+    main.pack(fill="both", expand=True)
+    main.columnconfigure(1, weight=1)
+    main.rowconfigure(2, weight=1)
+    main.rowconfigure(7, weight=1)
+
+    ttk.Label(main, text="VirtualDJ folder").grid(row=0, column=0, sticky="w")
+    vdj_entry = ttk.Entry(main, textvariable=vdj_var)
+    vdj_entry.grid(row=0, column=1, sticky="ew", padx=(8, 8))
+
+    def browse_vdj() -> None:
+        selected = filedialog.askdirectory(title="Choose VirtualDJ folder", initialdir=vdj_var.get() or str(Path.home()))
+        if selected:
+            vdj_var.set(selected)
+
+    ttk.Button(main, text="Browse", command=browse_vdj).grid(row=0, column=2, sticky="ew")
+
+    ttk.Label(main, text="Scan folders").grid(row=1, column=0, sticky="nw", pady=(10, 0))
+    scan_list = tk.Listbox(main, height=7, selectmode="extended")
+    scan_list.grid(row=1, column=1, rowspan=2, sticky="nsew", padx=(8, 8), pady=(10, 0))
+    scan_buttons = ttk.Frame(main)
+    scan_buttons.grid(row=1, column=2, sticky="new", pady=(10, 0))
+
+    def add_scan_folder() -> None:
+        selected = filedialog.askdirectory(title="Choose folder to scan for relocated music", initialdir=str(Path.home()))
+        if selected:
+            existing = set(scan_list.get(0, tk.END))
+            if selected not in existing:
+                scan_list.insert(tk.END, selected)
+
+    def remove_scan_folder() -> None:
+        for index in reversed(scan_list.curselection()):
+            scan_list.delete(index)
+
+    ttk.Button(scan_buttons, text="Add", command=add_scan_folder).pack(fill="x")
+    ttk.Button(scan_buttons, text="Remove", command=remove_scan_folder).pack(fill="x", pady=(8, 0))
+
+    checks = ttk.Frame(main)
+    checks.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+    ttk.Checkbutton(checks, text="Include database.xml", variable=include_database_var).pack(side="left")
+    ttk.Checkbutton(checks, text="Resume interrupted scan", variable=resume_var).pack(side="left", padx=(18, 0))
+    ttk.Checkbutton(checks, text="Deduplicate exact matches", variable=dedupe_var).pack(side="left", padx=(18, 0))
+    ttk.Checkbutton(checks, text="Repair whitespace variants", variable=whitespace_var).pack(side="left", padx=(18, 0))
+
+    mode_frame = ttk.Frame(main)
+    mode_frame.grid(row=4, column=0, columnspan=3, sticky="w", pady=(12, 0))
+    ttk.Label(mode_frame, text="Search mode").pack(side="left")
+    ttk.OptionMenu(mode_frame, search_mode_var, "auto", "auto", "everything", "scan").pack(side="left", padx=(8, 0))
+
+    button_frame = ttk.Frame(main)
+    button_frame.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+    dry_button = ttk.Button(button_frame, text="Dry Run")
+    apply_button = ttk.Button(button_frame, text="Apply Fixes")
+    stop_button = ttk.Button(button_frame, text="Stop", state="disabled")
+    dry_button.pack(side="left")
+    apply_button.pack(side="left", padx=(8, 0))
+    stop_button.pack(side="left", padx=(8, 0))
+
+    ttk.Label(main, text="Status").grid(row=6, column=0, sticky="w", pady=(12, 0))
+    status_text = tk.Text(main, height=14, wrap="word")
+    status_text.grid(row=7, column=0, columnspan=3, sticky="nsew", pady=(4, 0))
+
+    def append_status(message: str) -> None:
+        status_text.insert(tk.END, message + "\n")
+        status_text.see(tk.END)
+
+    def poll_status() -> None:
+        while True:
+            try:
+                append_status(status_queue.get_nowait())
+            except queue.Empty:
+                break
+        root.after(100, poll_status)
+
+    def set_running(running: bool) -> None:
+        state = "disabled" if running else "normal"
+        dry_button.configure(state=state)
+        apply_button.configure(state=state)
+        stop_button.configure(state="normal" if running else "disabled")
+
+    def build_options(apply: bool) -> RunOptions | None:
+        scan_roots = [Path(scan_list.get(index)) for index in range(scan_list.size())]
+        if not scan_roots:
+            messagebox.showerror("Missing scan folders", "Add at least one folder to scan.")
+            return None
+        return RunOptions(
+            vdj_root=Path(vdj_var.get()),
+            scan_roots=scan_roots,
+            include_database=include_database_var.get(),
+            apply=apply,
+            search_mode=search_mode_var.get(),
+            report_dir=DEFAULT_REPORT_DIR,
+            backup_dir=DEFAULT_BACKUP_DIR,
+            state_dir=DEFAULT_STATE_DIR,
+            max_everything_results=1000,
+            resume_scan=resume_var.get(),
+            dedupe_exact_candidates=dedupe_var.get(),
+            allow_whitespace_filename_fallback=whitespace_var.get(),
+        )
+
+    def run_job(apply: bool) -> None:
+        nonlocal worker
+        options = build_options(apply)
+        if options is None:
+            return
+        cancel_event.clear()
+        set_running(True)
+        status_text.delete("1.0", tk.END)
+
+        def worker_main() -> None:
+            try:
+                result = run_relocator(options, log=status_queue.put, cancel_event=cancel_event)
+                status_queue.put(format_result(result))
+                if result.canceled:
+                    root.after(0, lambda: messagebox.showwarning("Stopped", "The operation was stopped. Review the partial report if one was written."))
+                else:
+                    root.after(0, lambda: messagebox.showinfo("Finished", format_result(result)))
+            except Exception as exc:
+                status_queue.put(f"Error: {exc}")
+                root.after(0, lambda: messagebox.showerror("Error", str(exc)))
+            finally:
+                root.after(0, lambda: set_running(False))
+
+        worker = threading.Thread(target=worker_main, daemon=True)
+        worker.start()
+
+    def stop_job() -> None:
+        cancel_event.set()
+        append_status("Stop requested. Waiting for the current safe point...")
+
+    dry_button.configure(command=lambda: run_job(False))
+    apply_button.configure(command=lambda: run_job(True))
+    stop_button.configure(command=stop_job)
+    poll_status()
+    root.mainloop()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    if args.gui or (not args.no_gui and not args.scan_root):
+        launch_gui()
+        return 0
+    if not args.scan_root:
+        parser.error("at least one --scan-root is required when --no-gui is used")
+    options = options_from_args(args)
+    result = run_relocator(options, log=print)
+    print(format_result(result))
+    return 1 if result.canceled else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
