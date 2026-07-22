@@ -7,13 +7,14 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from vdj_relocator import RunOptions, run_relocator
+from vdj_relocator import RunOptions, build_arg_parser, playlist_path_from_args, run_relocator
 
 
 class PlaylistDedupTests(unittest.TestCase):
     def make_options(self, root: Path, apply: bool = True) -> RunOptions:
         return RunOptions(
             vdj_root=root / "VirtualDJ",
+            playlist_path=None,
             scan_roots=[root / "Music"],
             include_database=False,
             apply=apply,
@@ -25,6 +26,8 @@ class PlaylistDedupTests(unittest.TestCase):
             resume_scan=False,
             dedupe_exact_candidates=True,
             dedupe_playlist_entries=True,
+            prefer_scan_root_order=True,
+            ignore_file_extension=False,
             allow_whitespace_filename_fallback=True,
         )
 
@@ -157,6 +160,130 @@ class PlaylistDedupTests(unittest.TestCase):
             self.assertIn(str(song_a), content_a)
             self.assertNotIn(str(song_b), content_a)
             self.assertIn(str(song_b), content_b)
+
+    def test_single_playlist_option_limits_processing_to_selected_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            playlist_dir = root / "VirtualDJ" / "Playlists"
+            music_dir = root / "Music"
+            playlist_dir.mkdir(parents=True)
+            music_dir.mkdir()
+            song = music_dir / "Song.mp3"
+            song.write_bytes(b"song")
+
+            selected_playlist = playlist_dir / "Selected.m3u"
+            other_playlist = playlist_dir / "Other.m3u"
+            selected_playlist.write_text(
+                "\r\n".join(["#EXTM3U", str(song), str(song), ""]),
+                encoding="ascii",
+            )
+            other_playlist.write_text(
+                "\r\n".join(["#EXTM3U", str(song), str(song), ""]),
+                encoding="ascii",
+            )
+
+            options = self.make_options(root)
+            options.playlist_path = selected_playlist
+            options.scan_roots = []
+            result = run_relocator(options)
+
+            self.assertEqual(result.playlist_duplicates, 1)
+            self.assertEqual(result.sources_changed, 1)
+            self.assertEqual(selected_playlist.read_text(encoding="ascii").count(str(song)), 1)
+            self.assertEqual(other_playlist.read_text(encoding="ascii").count(str(song)), 2)
+
+    def test_dropped_playlist_argument_is_used_as_single_playlist(self) -> None:
+        parser = build_arg_parser()
+        dropped_playlist = Path(r"C:\Users\Mr. Jay\Documents\VirtualDJ\Playlists\Party.m3u")
+        args = parser.parse_args(["--gui", str(dropped_playlist)])
+
+        self.assertEqual(playlist_path_from_args(args), dropped_playlist)
+
+    def test_scan_root_priority_resolves_no_size_ambiguous_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            playlist_dir = root / "VirtualDJ" / "Playlists"
+            music_a = root / "MusicA"
+            music_b = root / "MusicB"
+            playlist_dir.mkdir(parents=True)
+            music_a.mkdir()
+            music_b.mkdir()
+            preferred = music_a / "Song.mp3"
+            fallback = music_b / "Song.mp3"
+            preferred.write_bytes(b"preferred")
+            fallback.write_bytes(b"different fallback")
+            playlist = playlist_dir / "No Size.m3u"
+            playlist.write_text(
+                "\r\n".join(["#EXTM3U", r"Z:\Missing\Song.mp3", ""]),
+                encoding="ascii",
+            )
+
+            options = self.make_options(root, apply=False)
+            options.scan_roots = [music_a, music_b]
+            result = run_relocator(options)
+
+            self.assertEqual(result.would_update, 1)
+            with result.report_path.open(newline="", encoding="utf-8-sig") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(rows[0]["new_path"], str(preferred))
+            self.assertEqual(rows[0]["match_status"], "matched_by_exact_filename_and_scan_root_priority_no_size")
+
+    def test_ignore_extension_matches_same_stem_audio_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            playlist_dir = root / "VirtualDJ" / "Playlists"
+            music_dir = root / "Music"
+            playlist_dir.mkdir(parents=True)
+            music_dir.mkdir()
+            replacement = music_dir / "Adriana Evans - Lucky Dayz.m4a"
+            replacement.write_bytes(b"m4a replacement")
+            playlist = playlist_dir / "Ignore Extension.m3u"
+            playlist.write_text(
+                "\r\n".join(["#EXTM3U", r"Z:\Missing\Adriana Evans - Lucky Dayz.mp3", ""]),
+                encoding="ascii",
+            )
+
+            options = self.make_options(root, apply=False)
+            options.ignore_file_extension = True
+            result = run_relocator(options)
+
+            self.assertEqual(result.would_update, 1)
+            with result.report_path.open(newline="", encoding="utf-8-sig") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(rows[0]["new_path"], str(replacement))
+            self.assertEqual(rows[0]["match_status"], "matched_by_filename_without_extension")
+
+    def test_ignore_extension_can_resolve_stored_size_mismatch_when_unique(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            playlist_dir = root / "VirtualDJ" / "Playlists"
+            music_dir = root / "Music"
+            playlist_dir.mkdir(parents=True)
+            music_dir.mkdir()
+            replacement = music_dir / "Adriana Evans - Lucky Dayz.m4a"
+            replacement.write_bytes(b"m4a replacement")
+            playlist = playlist_dir / "Ignore Extension Size.m3u"
+            playlist.write_text(
+                "\r\n".join(
+                    [
+                        "#EXTM3U",
+                        "#EXTVDJ:<filesize>999</filesize>",
+                        r"Z:\Missing\Adriana Evans - Lucky Dayz.mp3",
+                        "",
+                    ]
+                ),
+                encoding="ascii",
+            )
+
+            options = self.make_options(root, apply=False)
+            options.ignore_file_extension = True
+            result = run_relocator(options)
+
+            self.assertEqual(result.would_update, 1)
+            with result.report_path.open(newline="", encoding="utf-8-sig") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(rows[0]["new_path"], str(replacement))
+            self.assertEqual(rows[0]["match_status"], "matched_by_filename_without_extension_size_mismatch")
 
 
 if __name__ == "__main__":
