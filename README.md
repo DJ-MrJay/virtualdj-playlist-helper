@@ -11,11 +11,14 @@ The helper does not read or match audio tag metadata. Matching is based on missi
 ## What It Supports
 
 - VirtualDJ playlists: `Playlists\*.m3u` and `Playlists\*.m3u8`
+- Single-playlist mode by browsing for a file or dropping one onto the launcher
 - VirtualDJ virtual folders: `Folders\**\*.vdjfolder`
 - VirtualDJ database: `database.xml`
 - Exact filename matching
+- Optional filename matching without requiring the same extension
 - Whitespace-normalized filename fallback for messy VirtualDJ paths
 - File-size verification when VirtualDJ has a stored file size
+- Scan-folder-priority fallback when no stored file size exists
 - CSV reports for review
 - Backups before any edit
 - Stop and resume for interrupted direct folder scans
@@ -50,6 +53,7 @@ The helper is conservative:
 
 - If a file size is available, it only auto-fixes when filename and size both match.
 - If no file size is available, it only auto-fixes when exactly one filename match exists.
+- If no file size is available and multiple filename matches exist, it can use the scan folder order you selected when the highest-priority scan folder has exactly one candidate.
 - Ambiguous relocation candidates are skipped unless they are byte-identical and candidate deduplication is enabled.
 - Size mismatches are skipped, except for the whitespace parent-folder repair case described below.
 - Missing files that cannot be found are skipped.
@@ -59,6 +63,8 @@ When duplicate relocation candidates are byte-identical, the helper can resolve 
 When duplicate song entries appear inside the same playlist, the helper can remove later duplicate rows and keep the first occurrence. This cleanup is playlist-local: the same song can still appear in different playlists. It removes rows when the final path is the same, or when different existing paths have the same filename, same size, and same SHA-256 content hash.
 
 When filename spacing differs, for example `Artist - Song .mp3` versus `Artist - Song.mp3`, the helper can use a whitespace-normalized fallback. If multiple candidates are found, it only selects one when file size or the missing path's parent folder isolates a single candidate.
+
+When the extension differs, for example `Adriana Evans - Lucky Dayz.mp3` versus `Adriana Evans - Lucky Dayz.m4a`, the helper can use an opt-in extensionless fallback. This only compares the filename before the extension; it does not read audio tags.
 
 The helper does not use ID3, FLAC, or other audio metadata tags to guess matches.
 
@@ -138,7 +144,13 @@ Do not choose:
 C:\Program Files\VirtualDJ
 ```
 
-4. Add one or more **Scan folders**.
+4. Optional: choose a **Single playlist**.
+
+Use **Browse** to select one `.m3u` or `.m3u8` file with Explorer. When a single playlist is selected, the helper processes only that playlist instead of all playlists in your VirtualDJ folder.
+
+You can also drop one `.m3u` or `.m3u8` file onto `Run-VDJ-Relocator.bat`. The GUI opens with that playlist preloaded.
+
+5. Add one or more **Scan folders**.
 
 Choose folders where your relocated music files now exist, for example:
 
@@ -150,19 +162,25 @@ F:\DJ Library
 
 These folders also act as a safety filter when using Everything, so the helper does not relink to random duplicate files elsewhere on your computer.
 
-5. Leave **Include database.xml** checked unless you only want to repair playlists and virtual folders.
+Scan folder order matters. If VirtualDJ did not store a file size and the same filename exists in multiple scan folders, **Prefer scan folder order** lets the helper choose the single candidate from the earliest scan folder in your list.
 
-6. Leave **Resume interrupted scan** checked unless you want every run to start fresh.
+If you only want to remove duplicates from a selected playlist and do not need missing-file relocation, scan folders are optional.
 
-7. Leave **Resolve byte-identical candidates** checked if you want byte-identical duplicate file candidates to resolve to one canonical path.
+6. Leave **Include database.xml** checked unless you only want to repair playlists and virtual folders.
+
+When a single playlist is selected, `database.xml` and VirtualDJ virtual folders are ignored for that run.
+
+7. Leave **Resume interrupted scan** checked unless you want every run to start fresh.
+
+8. Leave **Resolve byte-identical candidates** checked if you want byte-identical duplicate file candidates to resolve to one canonical path.
 
 The helper verifies duplicate candidates by file size and SHA-256 content hash before choosing one. It prefers paths from the scan folders in the order you selected them.
 
-8. Leave **Remove playlist duplicates** checked if you want duplicate song rows removed inside each playlist.
+9. Leave **Remove playlist duplicates** checked if you want duplicate song rows removed inside each playlist.
 
 This only removes duplicate rows within the same `.m3u` or `.m3u8` playlist. It keeps the first occurrence in that playlist. The same song can remain in other playlists. Different existing paths are only treated as duplicates when they have the same filename, same size, and same SHA-256 content hash.
 
-9. Leave **Repair whitespace variants** checked if you want the helper to repair filenames that only differ by extra or missing spaces.
+10. Leave **Repair whitespace variants** checked if you want the helper to repair filenames that only differ by extra or missing spaces.
 
 Example:
 
@@ -176,17 +194,31 @@ A Few Good Men - Walk You Thru.mp3
 
 If multiple whitespace-normalized candidates exist, the helper uses file size first. If file size is unavailable or stale, it may use parent-folder context only when exactly one candidate is in the same immediate parent folder.
 
-10. Choose **Search mode**:
+Leave **Prefer scan folder order** checked if you want the helper to resolve no-filesize duplicate filename matches using the order of your scan folders.
+
+Enable **Ignore file extension** if you want files with the same name but different audio extensions to be treated as candidates.
+
+Example:
+
+```text
+Missing VirtualDJ filename:
+Adriana Evans - Lucky Dayz.mp3
+
+Actual filename:
+Adriana Evans - Lucky Dayz.m4a
+```
+
+11. Choose **Search mode**:
 
 - `auto`: use `es.exe` first, then direct folder scan if needed
 - `everything`: require `es.exe`
 - `scan`: direct folder scan only
 
-11. Click **Dry Run**.
+12. Click **Dry Run**.
 
 This writes a CSV report and makes no changes.
 
-12. Review the newest CSV in:
+13. Review the newest CSV in:
 
 ```text
 reports
@@ -219,9 +251,35 @@ match_status = matched_by_normalized_filename_and_parent
 match_status = matched_by_normalized_filename_and_parent_size_mismatch
 ```
 
-13. If the report looks correct, make sure VirtualDJ is closed, then click **Apply Fixes**.
+Rows with these values used scan folder order because VirtualDJ had no stored file size:
 
-14. Reopen VirtualDJ and check the repaired playlists.
+```text
+match_status = matched_by_exact_filename_and_scan_root_priority_no_size
+match_status = matched_by_normalized_filename_and_scan_root_priority_no_size
+```
+
+Rows with these values used extensionless matching:
+
+```text
+match_status = matched_by_filename_without_extension
+match_status = matched_by_filename_without_extension_and_size
+match_status = matched_by_filename_without_extension_size_mismatch
+match_status = matched_by_filename_without_extension_and_parent
+match_status = matched_by_filename_without_extension_and_parent_size_mismatch
+match_status = matched_by_filename_without_extension_and_scan_root_priority_no_size
+match_status = matched_by_filename_without_extension_and_scan_root_priority_size_mismatch
+match_status = matched_by_normalized_filename_without_extension
+match_status = matched_by_normalized_filename_without_extension_and_size
+match_status = matched_by_normalized_filename_without_extension_size_mismatch
+match_status = matched_by_normalized_filename_without_extension_and_parent
+match_status = matched_by_normalized_filename_without_extension_and_parent_size_mismatch
+match_status = matched_by_normalized_filename_without_extension_and_scan_root_priority_no_size
+match_status = matched_by_normalized_filename_without_extension_and_scan_root_priority_size_mismatch
+```
+
+14. If the report looks correct, make sure VirtualDJ is closed, then click **Apply Fixes**.
+
+15. Reopen VirtualDJ and check the repaired playlists.
 
 ## Command-Line Usage
 
@@ -255,6 +313,18 @@ Skip `database.xml` and only process playlists plus virtual folders:
 python .\vdj_relocator.py --no-gui --no-database --scan-root "D:\Music"
 ```
 
+Process only one playlist:
+
+```powershell
+python .\vdj_relocator.py --no-gui --playlist "C:\Users\<you>\Documents\VirtualDJ\Playlists\Party.m3u" --scan-root "D:\Music"
+```
+
+Remove duplicates from one playlist without relocating missing files:
+
+```powershell
+python .\vdj_relocator.py --no-gui --playlist "C:\Users\<you>\Documents\VirtualDJ\Playlists\Party.m3u"
+```
+
 Ignore interrupted-scan checkpoints and start fresh:
 
 ```powershell
@@ -271,6 +341,18 @@ Disable duplicate row cleanup inside playlists:
 
 ```powershell
 python .\vdj_relocator.py --no-gui --no-playlist-dedupe --scan-root "D:\Music"
+```
+
+Disable scan-folder-priority matching for entries without a stored file size:
+
+```powershell
+python .\vdj_relocator.py --no-gui --no-scan-root-priority --scan-root "D:\Music"
+```
+
+Enable extensionless matching:
+
+```powershell
+python .\vdj_relocator.py --no-gui --ignore-extension --scan-root "D:\Music"
 ```
 
 Disable whitespace-normalized filename fallback:
@@ -336,6 +418,10 @@ D:\Music\Aaliyah - Try Again.mp3
 ```
 
 If VirtualDJ stored a file size, the helper checks the candidate size too. If there are multiple possible matches or the size does not match, the entry is skipped and listed in the report.
+
+If VirtualDJ did not store a file size and multiple filename candidates exist, **Prefer scan folder order** can select one. It only does this when the earliest scan folder containing matches has exactly one candidate. This is meant for cases where you choose scan folders in trusted priority order, such as `D:\Music` before `E:\Afro`.
+
+If **Ignore file extension** is enabled, the helper also searches common audio extensions for files with the same filename stem. A missing `.mp3` can therefore match an existing `.m4a`, `.flac`, `.wav`, and other common audio formats. If VirtualDJ stored a file size and the only extensionless candidate differs in size, the helper can still mark it for update, but the CSV reports that as `matched_by_filename_without_extension_size_mismatch`.
 
 If **Resolve byte-identical candidates** is enabled and multiple relocation candidates have the same filename, same size, and same SHA-256 content hash, the helper picks one canonical path and uses that as the replacement. The canonical path is selected by scan folder order first, then shorter path, then alphabetical path.
 
