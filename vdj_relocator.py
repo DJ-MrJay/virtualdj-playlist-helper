@@ -1742,7 +1742,7 @@ def launch_gui(initial_playlist: Path | None = None) -> None:
     button_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(12, 0))
     dry_button = ttk.Button(button_frame, text="Dry Run")
     apply_button = ttk.Button(button_frame, text="Apply Fixes")
-    undo_button = ttk.Button(button_frame, text="Undo Last Apply")
+    undo_button = ttk.Button(button_frame, text="Undo Last")
     stop_button = ttk.Button(button_frame, text="Stop", state="disabled")
     dry_button.pack(side="left")
     apply_button.pack(side="left", padx=(8, 0))
