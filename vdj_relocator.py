@@ -41,6 +41,20 @@ XML_TAG_RE = re.compile(r"<(?![!?/])[^>]+>", re.DOTALL)
 WHITESPACE_RE = re.compile(r"\s+")
 PATH_ATTRS = ("FilePath", "filepath", "File", "file", "Path", "path")
 SIZE_ATTRS = ("FileSize", "filesize", "Size", "size")
+AUDIO_FILE_EXTENSIONS = {
+    ".aac",
+    ".aif",
+    ".aiff",
+    ".alac",
+    ".flac",
+    ".m4a",
+    ".mp3",
+    ".mp4",
+    ".ogg",
+    ".opus",
+    ".wav",
+    ".wma",
+}
 
 
 @dataclasses.dataclass
@@ -103,6 +117,7 @@ class PlaylistDuplicate:
 @dataclasses.dataclass
 class RunOptions:
     vdj_root: Path
+    playlist_path: Path | None
     scan_roots: list[Path]
     include_database: bool
     apply: bool
@@ -114,6 +129,8 @@ class RunOptions:
     resume_scan: bool
     dedupe_exact_candidates: bool
     dedupe_playlist_entries: bool
+    prefer_scan_root_order: bool
+    ignore_file_extension: bool
     allow_whitespace_filename_fallback: bool
 
 
@@ -244,6 +261,16 @@ def normalize_filename_for_match(filename: str) -> str:
     return f"{stem}{ext}".lower()
 
 
+def filename_stem_for_match(filename: str) -> str:
+    stem, _ext = ntpath.splitext(filename)
+    return stem.strip().lower()
+
+
+def normalize_filename_stem_for_match(filename: str) -> str:
+    stem, _ext = ntpath.splitext(filename)
+    return WHITESPACE_RE.sub(" ", stem).strip().lower()
+
+
 def normalize_path_component_for_match(value: str) -> str:
     return WHITESPACE_RE.sub(" ", value).strip().lower()
 
@@ -259,6 +286,14 @@ def exact_filename_key(filename: str) -> str:
 
 def normalized_filename_key(filename: str) -> str:
     return f"normalized:{normalize_filename_for_match(filename)}"
+
+
+def extensionless_filename_key(filename: str) -> str:
+    return f"stem:{filename_stem_for_match(filename)}"
+
+
+def normalized_extensionless_filename_key(filename: str) -> str:
+    return f"normalized_stem:{normalize_filename_stem_for_match(filename)}"
 
 
 def attr_match(tag: str, attr_name: str) -> re.Match[str] | None:
@@ -283,8 +318,26 @@ def load_source(path: Path, kind: str) -> SourceFile:
     return SourceFile(path=path, kind=kind, encoding=encoding, text=text)
 
 
-def discover_sources(vdj_root: Path, include_database: bool, log: Callable[[str], None]) -> list[SourceFile]:
+def is_supported_playlist(path: Path) -> bool:
+    return path.suffix.lower() in {".m3u", ".m3u8"}
+
+
+def discover_sources(
+    vdj_root: Path,
+    include_database: bool,
+    playlist_path: Path | None,
+    log: Callable[[str], None],
+) -> list[SourceFile]:
     sources: list[SourceFile] = []
+    if playlist_path is not None:
+        if not playlist_path.exists():
+            raise FileNotFoundError(f"Selected playlist does not exist: {playlist_path}")
+        if not playlist_path.is_file() or not is_supported_playlist(playlist_path):
+            raise ValueError(f"Selected file is not a supported playlist: {playlist_path}")
+        sources.append(load_source(playlist_path, "playlist"))
+        log(f"Loaded selected playlist: {playlist_path}")
+        return sources
+
     playlists = vdj_root / "Playlists"
     if playlists.exists():
         for pattern in ("*.m3u", "*.m3u8"):
@@ -494,15 +547,27 @@ def clear_checkpoint(state_dir: Path) -> None:
         path.unlink()
 
 
-def wanted_filename_sets(entries: list[MissingEntry], allow_whitespace: bool) -> tuple[set[str], set[str]]:
+def wanted_filename_sets(
+    entries: list[MissingEntry],
+    allow_whitespace: bool,
+    ignore_file_extension: bool,
+) -> tuple[set[str], set[str], set[str], set[str]]:
     exact = {exact_filename_key(entry.filename) for entry in entries}
     normalized: set[str] = set()
     if allow_whitespace:
         normalized = {normalized_filename_key(entry.filename) for entry in entries}
-    return exact, normalized
+    extensionless: set[str] = set()
+    normalized_extensionless: set[str] = set()
+    if ignore_file_extension:
+        extensionless = {extensionless_filename_key(entry.filename) for entry in entries}
+        if allow_whitespace:
+            normalized_extensionless = {normalized_extensionless_filename_key(entry.filename) for entry in entries}
+    return exact, normalized, extensionless, normalized_extensionless
 
 
-def wanted_extensions(entries: list[MissingEntry]) -> set[str]:
+def wanted_extensions(entries: list[MissingEntry], ignore_file_extension: bool) -> set[str]:
+    if ignore_file_extension:
+        return set(AUDIO_FILE_EXTENSIONS)
     return {ntpath.splitext(entry.filename)[1].lower() for entry in entries if ntpath.splitext(entry.filename)[1]}
 
 
@@ -510,9 +575,11 @@ def scan_fingerprint(entries: list[MissingEntry], options: RunOptions, search_en
     payload = {
         "index_version": 2,
         "search_engine": search_engine,
+        "playlist_path": normalize_for_compare(options.playlist_path) if options.playlist_path else "",
         "scan_roots": [normalize_for_compare(root) for root in options.scan_roots],
         "filenames": sorted({entry.filename.lower() for entry in entries}),
         "allow_whitespace": options.allow_whitespace_filename_fallback,
+        "ignore_file_extension": options.ignore_file_extension,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -530,16 +597,31 @@ def file_is_under_root(path: str | Path, root: str | Path) -> bool:
     return path_norm == root_norm or path_norm.startswith(root_norm.rstrip("\\/") + os.sep)
 
 
-def index_candidate_path(index: dict[str, list[str]], path: str, exact_wanted: set[str], normalized_wanted: set[str]) -> bool:
+def index_candidate_path(
+    index: dict[str, list[str]],
+    path: str,
+    exact_wanted: set[str],
+    normalized_wanted: set[str],
+    extensionless_wanted: set[str],
+    normalized_extensionless_wanted: set[str],
+) -> bool:
     name = ntpath.basename(path.replace("/", "\\"))
     found = False
     exact_key = exact_filename_key(name)
     normalized_key = normalized_filename_key(name)
+    extensionless_key = extensionless_filename_key(name)
+    normalized_extensionless_key = normalized_extensionless_filename_key(name)
     if exact_key in exact_wanted:
         add_index_candidate(index, exact_key, path)
         found = True
     if normalized_key in normalized_wanted:
         add_index_candidate(index, normalized_key, path)
+        found = True
+    if extensionless_key in extensionless_wanted:
+        add_index_candidate(index, extensionless_key, path)
+        found = True
+    if normalized_extensionless_key in normalized_extensionless_wanted:
+        add_index_candidate(index, normalized_extensionless_key, path)
         found = True
     return found
 
@@ -559,8 +641,8 @@ def find_es_executable() -> str | None:
     return None
 
 
-def everything_extension_query(entries: list[MissingEntry]) -> str:
-    extensions = sorted(ext.lstrip(".") for ext in wanted_extensions(entries) if ext)
+def everything_extension_query(entries: list[MissingEntry], ignore_file_extension: bool) -> str:
+    extensions = sorted(ext.lstrip(".") for ext in wanted_extensions(entries, ignore_file_extension) if ext)
     if not extensions:
         return ""
     return f"ext:{';'.join(extensions)}"
@@ -574,6 +656,8 @@ def everything_scan_root(
     checkpoint: SearchCheckpoint,
     exact_wanted: set[str],
     normalized_wanted: set[str],
+    extensionless_wanted: set[str],
+    normalized_extensionless_wanted: set[str],
     cancel_event: threading.Event | None,
 ) -> None:
     command = [es, "-path", str(root), "-full-path-and-name"]
@@ -596,7 +680,14 @@ def everything_scan_root(
             candidate = line.strip()
             if not candidate or not file_is_under_root(candidate, root):
                 continue
-            if index_candidate_path(checkpoint.index, candidate, exact_wanted, normalized_wanted):
+            if index_candidate_path(
+                checkpoint.index,
+                candidate,
+                exact_wanted,
+                normalized_wanted,
+                extensionless_wanted,
+                normalized_extensionless_wanted,
+            ):
                 checkpoint.result_count += 1
         stderr = process.stderr.read() if process.stderr is not None else ""
         return_code = process.wait()
@@ -616,14 +707,18 @@ def build_index_everything(
     es = find_es_executable()
     if not es:
         raise RuntimeError("es.exe was not found")
-    exact_wanted, normalized_wanted = wanted_filename_sets(entries, options.allow_whitespace_filename_fallback)
+    exact_wanted, normalized_wanted, extensionless_wanted, normalized_extensionless_wanted = wanted_filename_sets(
+        entries,
+        options.allow_whitespace_filename_fallback,
+        options.ignore_file_extension,
+    )
     fingerprint = scan_fingerprint(entries, options, "everything")
     checkpoint = load_checkpoint(options.state_dir, fingerprint, "everything") if options.resume_scan else None
     if checkpoint:
         log("Resuming Everything search checkpoint.")
     else:
         checkpoint = SearchCheckpoint(fingerprint=fingerprint, search_engine="everything")
-    query_text = everything_extension_query(entries)
+    query_text = everything_extension_query(entries, options.ignore_file_extension)
     for root in options.scan_roots:
         root_text = str(root)
         root_key = normalize_for_compare(root)
@@ -642,6 +737,8 @@ def build_index_everything(
             checkpoint,
             exact_wanted,
             normalized_wanted,
+            extensionless_wanted,
+            normalized_extensionless_wanted,
             cancel_event,
         )
         checkpoint.completed_roots.add(root_key)
@@ -658,8 +755,12 @@ def build_index_by_scan(
     log: Callable[[str], None],
     cancel_event: threading.Event | None,
 ) -> tuple[dict[str, list[str]], bool]:
-    exact_wanted, normalized_wanted = wanted_filename_sets(entries, options.allow_whitespace_filename_fallback)
-    wanted_exts = wanted_extensions(entries)
+    exact_wanted, normalized_wanted, extensionless_wanted, normalized_extensionless_wanted = wanted_filename_sets(
+        entries,
+        options.allow_whitespace_filename_fallback,
+        options.ignore_file_extension,
+    )
+    wanted_exts = wanted_extensions(entries, options.ignore_file_extension)
     fingerprint = scan_fingerprint(entries, options, "scan")
     checkpoint = load_checkpoint(options.state_dir, fingerprint, "scan") if options.resume_scan else None
     if checkpoint:
@@ -693,7 +794,14 @@ def build_index_by_scan(
                                     log(f"Scanned {checkpoint.scanned_files} files...")
                                 if wanted_exts and ntpath.splitext(item.name)[1].lower() not in wanted_exts:
                                     continue
-                                if index_candidate_path(checkpoint.index, item.path, exact_wanted, normalized_wanted):
+                                if index_candidate_path(
+                                    checkpoint.index,
+                                    item.path,
+                                    exact_wanted,
+                                    normalized_wanted,
+                                    extensionless_wanted,
+                                    normalized_extensionless_wanted,
+                                ):
                                     checkpoint.result_count += 1
                         except OSError:
                             continue
@@ -771,6 +879,24 @@ def candidate_sort_key(path: str, scan_roots: list[Path]) -> tuple[int, int, str
 
 def canonical_candidate(paths: list[str], scan_roots: list[Path]) -> str:
     return sorted(paths, key=lambda item: candidate_sort_key(item, scan_roots))[0]
+
+
+def scan_root_priority_candidate(candidates: list[str], scan_roots: list[Path]) -> str | None:
+    if len(candidates) < 2 or not scan_roots:
+        return None
+    buckets: dict[int, list[str]] = {}
+    for candidate in candidates:
+        for index, root in enumerate(scan_roots):
+            if file_is_under_root(candidate, root):
+                buckets.setdefault(index, []).append(candidate)
+                break
+    if not buckets:
+        return None
+    first_priority = min(buckets)
+    first_candidates = buckets[first_priority]
+    if len(first_candidates) == 1:
+        return first_candidates[0]
+    return None
 
 
 def dedupe_exact_candidates(
@@ -855,7 +981,15 @@ def resolve_candidates(
         mark_skip(entry, "not_found", "No matching file was found in the selected scan folders.")
         return
 
-    prefix = "matched_by_exact_filename" if match_kind == "exact" else "matched_by_normalized_filename"
+    prefixes = {
+        "exact": "matched_by_exact_filename",
+        "normalized": "matched_by_normalized_filename",
+        "extensionless": "matched_by_filename_without_extension",
+        "normalized_extensionless": "matched_by_normalized_filename_without_extension",
+    }
+    prefix = prefixes[match_kind]
+    extensionless_match = match_kind in {"extensionless", "normalized_extensionless"}
+    parent_context_allowed = match_kind in {"normalized", "extensionless", "normalized_extensionless"}
     if entry.expected_size is not None:
         size_matches = [candidate for candidate in candidates if safe_file_size(candidate) == entry.expected_size]
         if len(size_matches) == 1:
@@ -869,14 +1003,32 @@ def resolve_candidates(
                     return
             mark_skip(entry, "ambiguous", "Multiple candidates match the stored file size.")
             return
-        if match_kind == "normalized":
+        if extensionless_match and len(candidates) == 1:
+            mark_update(
+                entry,
+                candidates[0],
+                f"{prefix}_size_mismatch",
+                "Filename matches when extension is ignored, but VirtualDJ's stored file size differs.",
+            )
+            return
+        if parent_context_allowed:
             parent_candidate = parent_context_candidate(entry, candidates)
             if parent_candidate:
                 mark_update(
                     entry,
                     parent_candidate,
-                    "matched_by_normalized_filename_and_parent_size_mismatch",
-                    "Whitespace-normalized filename and parent folder match, but stored file size differs.",
+                    f"{prefix}_and_parent_size_mismatch",
+                    "Filename and parent folder match, but VirtualDJ's stored file size differs.",
+                )
+                return
+        if extensionless_match and options.prefer_scan_root_order:
+            priority_candidate = scan_root_priority_candidate(candidates, options.scan_roots)
+            if priority_candidate:
+                mark_update(
+                    entry,
+                    priority_candidate,
+                    f"{prefix}_and_scan_root_priority_size_mismatch",
+                    "Filename matches when extension is ignored; stored file size differs, so selected the only candidate in the highest-priority scan folder.",
                 )
                 return
         mark_skip(entry, "size_mismatch", "Filename exists, but no candidate matches VirtualDJ's stored file size.")
@@ -890,14 +1042,24 @@ def resolve_candidates(
         if deduped:
             mark_update(entry, deduped, "deduped_exact_duplicate", "Multiple candidates are byte-identical; selected canonical path.")
             return
-    if match_kind == "normalized":
+    if parent_context_allowed:
         parent_candidate = parent_context_candidate(entry, candidates)
         if parent_candidate:
             mark_update(
                 entry,
                 parent_candidate,
-                "matched_by_normalized_filename_and_parent",
-                "Whitespace-normalized filename and parent folder identify one candidate.",
+                f"{prefix}_and_parent",
+                "Filename and parent folder identify one candidate.",
+            )
+            return
+    if options.prefer_scan_root_order:
+        priority_candidate = scan_root_priority_candidate(candidates, options.scan_roots)
+        if priority_candidate:
+            mark_update(
+                entry,
+                priority_candidate,
+                f"{prefix}_and_scan_root_priority_no_size",
+                "No stored file size; multiple filename candidates found, selected the only candidate in the highest-priority scan folder.",
             )
             return
     mark_skip(entry, "ambiguous", "Multiple candidates were found and none could be selected safely.")
@@ -921,6 +1083,16 @@ def resolve_matches(
             if normalized_candidates:
                 resolve_candidates(entry, normalized_candidates, "normalized", options, cancel_event)
                 continue
+        if options.ignore_file_extension:
+            extensionless_candidates = index.get(extensionless_filename_key(entry.filename), [])
+            if extensionless_candidates:
+                resolve_candidates(entry, extensionless_candidates, "extensionless", options, cancel_event)
+                continue
+            if options.allow_whitespace_filename_fallback:
+                normalized_extensionless_candidates = index.get(normalized_extensionless_filename_key(entry.filename), [])
+                if normalized_extensionless_candidates:
+                    resolve_candidates(entry, normalized_extensionless_candidates, "normalized_extensionless", options, cancel_event)
+                    continue
         mark_skip(entry, "not_found", "No matching file was found in the selected scan folders.")
     log("Resolved candidate matches.")
 
@@ -1247,7 +1419,7 @@ def run_relocator(
     canceled = False
     try:
         check_cancel(cancel_event)
-        sources = discover_sources(options.vdj_root, options.include_database, log)
+        sources = discover_sources(options.vdj_root, options.include_database, options.playlist_path, log)
         entries = parse_sources(sources, log)
         check_cancel(cancel_event)
         index, search_engine, resumed = build_search_index(entries, options, log, cancel_event)
@@ -1297,9 +1469,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Relink missing VirtualDJ playlist/folder/database paths by exact filename match."
     )
+    parser.add_argument("dropped_files", nargs="*", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--gui", action="store_true", help="Launch the folder-picker GUI.")
     parser.add_argument("--no-gui", action="store_true", help="Do not launch the GUI when scan roots are omitted.")
     parser.add_argument("--vdj-root", type=Path, default=DEFAULT_VDJ_ROOT, help=f"VirtualDJ folder. Default: {DEFAULT_VDJ_ROOT}")
+    parser.add_argument("--playlist", type=Path, help="Only process this .m3u or .m3u8 playlist file.")
     parser.add_argument("--scan-root", type=Path, action="append", default=[], help="Folder to search for relocated music. May be supplied multiple times.")
     parser.add_argument("--apply", action="store_true", help="Write confirmed replacements. Without this, only a report is written.")
     parser.add_argument("--no-database", action="store_true", help="Do not scan/update database.xml; only playlists and .vdjfolder files are checked.")
@@ -1311,13 +1485,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-resume", action="store_true", help="Ignore and do not write interrupted-scan checkpoints.")
     parser.add_argument("--no-dedupe-exact", action="store_true", help="Do not consolidate byte-identical duplicate file candidates; leave them ambiguous.")
     parser.add_argument("--no-playlist-dedupe", action="store_true", help="Do not remove duplicate song entries within each playlist.")
+    parser.add_argument("--no-scan-root-priority", action="store_true", help="Do not use scan folder order to resolve no-size ambiguous filename matches.")
+    parser.add_argument("--ignore-extension", action="store_true", help="Treat audio files with the same name but different extensions as filename matches.")
     parser.add_argument("--no-whitespace-fallback", action="store_true", help="Do not repair filename matches that only differ by extra or missing whitespace.")
     return parser
+
+
+def playlist_path_from_args(args: argparse.Namespace) -> Path | None:
+    if args.playlist:
+        return args.playlist
+    for dropped_file in args.dropped_files:
+        if is_supported_playlist(dropped_file):
+            return dropped_file
+    return None
 
 
 def options_from_args(args: argparse.Namespace) -> RunOptions:
     return RunOptions(
         vdj_root=args.vdj_root,
+        playlist_path=playlist_path_from_args(args),
         scan_roots=args.scan_root,
         include_database=not args.no_database,
         apply=args.apply,
@@ -1329,11 +1515,13 @@ def options_from_args(args: argparse.Namespace) -> RunOptions:
         resume_scan=not args.no_resume,
         dedupe_exact_candidates=not args.no_dedupe_exact,
         dedupe_playlist_entries=not args.no_playlist_dedupe,
+        prefer_scan_root_order=not args.no_scan_root_priority,
+        ignore_file_extension=args.ignore_extension,
         allow_whitespace_filename_fallback=not args.no_whitespace_fallback,
     )
 
 
-def launch_gui() -> None:
+def launch_gui(initial_playlist: Path | None = None) -> None:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
@@ -1342,11 +1530,14 @@ def launch_gui() -> None:
     root.geometry("980x700")
 
     vdj_var = tk.StringVar(value=str(DEFAULT_VDJ_ROOT))
+    playlist_var = tk.StringVar(value=str(initial_playlist) if initial_playlist else "")
     search_mode_var = tk.StringVar(value="auto")
     include_database_var = tk.BooleanVar(value=True)
     resume_var = tk.BooleanVar(value=True)
     dedupe_var = tk.BooleanVar(value=True)
     playlist_dedupe_var = tk.BooleanVar(value=True)
+    scan_root_priority_var = tk.BooleanVar(value=True)
+    ignore_extension_var = tk.BooleanVar(value=False)
     whitespace_var = tk.BooleanVar(value=True)
     status_queue: queue.Queue[str] = queue.Queue()
     cancel_event = threading.Event()
@@ -1355,8 +1546,8 @@ def launch_gui() -> None:
     main = ttk.Frame(root, padding=12)
     main.pack(fill="both", expand=True)
     main.columnconfigure(1, weight=1)
-    main.rowconfigure(2, weight=1)
-    main.rowconfigure(7, weight=1)
+    main.rowconfigure(3, weight=1)
+    main.rowconfigure(8, weight=1)
 
     ttk.Label(main, text="VirtualDJ folder").grid(row=0, column=0, sticky="w")
     vdj_entry = ttk.Entry(main, textvariable=vdj_var)
@@ -1369,11 +1560,38 @@ def launch_gui() -> None:
 
     ttk.Button(main, text="Browse", command=browse_vdj).grid(row=0, column=2, sticky="ew")
 
-    ttk.Label(main, text="Scan folders").grid(row=1, column=0, sticky="nw", pady=(10, 0))
+    ttk.Label(main, text="Single playlist").grid(row=1, column=0, sticky="w", pady=(10, 0))
+    playlist_entry = ttk.Entry(main, textvariable=playlist_var)
+    playlist_entry.grid(row=1, column=1, sticky="ew", padx=(8, 8), pady=(10, 0))
+    playlist_buttons = ttk.Frame(main)
+    playlist_buttons.grid(row=1, column=2, sticky="ew", pady=(10, 0))
+
+    def browse_playlist() -> None:
+        initial_dir = str(Path(playlist_var.get()).parent) if playlist_var.get().strip() else str(DEFAULT_VDJ_ROOT / "Playlists")
+        selected = filedialog.askopenfilename(
+            title="Choose one VirtualDJ playlist",
+            initialdir=initial_dir,
+            filetypes=[
+                ("VirtualDJ playlists", "*.m3u *.m3u8"),
+                ("M3U playlists", "*.m3u"),
+                ("M3U8 playlists", "*.m3u8"),
+                ("All files", "*.*"),
+            ],
+        )
+        if selected:
+            playlist_var.set(selected)
+
+    def clear_playlist() -> None:
+        playlist_var.set("")
+
+    ttk.Button(playlist_buttons, text="Browse", command=browse_playlist).pack(side="left", fill="x", expand=True)
+    ttk.Button(playlist_buttons, text="Clear", command=clear_playlist).pack(side="left", fill="x", expand=True, padx=(6, 0))
+
+    ttk.Label(main, text="Scan folders").grid(row=2, column=0, sticky="nw", pady=(10, 0))
     scan_list = tk.Listbox(main, height=7, selectmode="extended")
-    scan_list.grid(row=1, column=1, rowspan=2, sticky="nsew", padx=(8, 8), pady=(10, 0))
+    scan_list.grid(row=2, column=1, rowspan=2, sticky="nsew", padx=(8, 8), pady=(10, 0))
     scan_buttons = ttk.Frame(main)
-    scan_buttons.grid(row=1, column=2, sticky="new", pady=(10, 0))
+    scan_buttons.grid(row=2, column=2, sticky="new", pady=(10, 0))
 
     def add_scan_folder() -> None:
         selected = filedialog.askdirectory(title="Choose folder to scan for relocated music", initialdir=str(Path.home()))
@@ -1390,20 +1608,22 @@ def launch_gui() -> None:
     ttk.Button(scan_buttons, text="Remove", command=remove_scan_folder).pack(fill="x", pady=(8, 0))
 
     checks = ttk.Frame(main)
-    checks.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+    checks.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(12, 0))
     ttk.Checkbutton(checks, text="Include database.xml", variable=include_database_var).grid(row=0, column=0, sticky="w")
     ttk.Checkbutton(checks, text="Resume interrupted scan", variable=resume_var).grid(row=0, column=1, sticky="w", padx=(18, 0))
     ttk.Checkbutton(checks, text="Repair whitespace variants", variable=whitespace_var).grid(row=0, column=2, sticky="w", padx=(18, 0))
     ttk.Checkbutton(checks, text="Resolve byte-identical candidates", variable=dedupe_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
     ttk.Checkbutton(checks, text="Remove playlist duplicates", variable=playlist_dedupe_var).grid(row=1, column=1, sticky="w", padx=(18, 0), pady=(6, 0))
+    ttk.Checkbutton(checks, text="Prefer scan folder order", variable=scan_root_priority_var).grid(row=1, column=2, sticky="w", padx=(18, 0), pady=(6, 0))
+    ttk.Checkbutton(checks, text="Ignore file extension", variable=ignore_extension_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
 
     mode_frame = ttk.Frame(main)
-    mode_frame.grid(row=4, column=0, columnspan=3, sticky="w", pady=(12, 0))
+    mode_frame.grid(row=5, column=0, columnspan=3, sticky="w", pady=(12, 0))
     ttk.Label(mode_frame, text="Search mode").pack(side="left")
     ttk.OptionMenu(mode_frame, search_mode_var, "auto", "auto", "everything", "scan").pack(side="left", padx=(8, 0))
 
     button_frame = ttk.Frame(main)
-    button_frame.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+    button_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(12, 0))
     dry_button = ttk.Button(button_frame, text="Dry Run")
     apply_button = ttk.Button(button_frame, text="Apply Fixes")
     stop_button = ttk.Button(button_frame, text="Stop", state="disabled")
@@ -1411,9 +1631,9 @@ def launch_gui() -> None:
     apply_button.pack(side="left", padx=(8, 0))
     stop_button.pack(side="left", padx=(8, 0))
 
-    ttk.Label(main, text="Status").grid(row=6, column=0, sticky="w", pady=(12, 0))
+    ttk.Label(main, text="Status").grid(row=7, column=0, sticky="w", pady=(12, 0))
     status_text = tk.Text(main, height=14, wrap="word")
-    status_text.grid(row=7, column=0, columnspan=3, sticky="nsew", pady=(4, 0))
+    status_text.grid(row=8, column=0, columnspan=3, sticky="nsew", pady=(4, 0))
 
     def append_status(message: str) -> None:
         status_text.insert(tk.END, message + "\n")
@@ -1435,11 +1655,17 @@ def launch_gui() -> None:
 
     def build_options(apply: bool) -> RunOptions | None:
         scan_roots = [Path(scan_list.get(index)) for index in range(scan_list.size())]
-        if not scan_roots:
-            messagebox.showerror("Missing scan folders", "Add at least one folder to scan.")
+        playlist_text = playlist_var.get().strip()
+        playlist_path = Path(playlist_text) if playlist_text else None
+        if playlist_path is not None and not is_supported_playlist(playlist_path):
+            messagebox.showerror("Unsupported playlist", "Choose a .m3u or .m3u8 playlist file.")
+            return None
+        if not scan_roots and playlist_path is None:
+            messagebox.showerror("Missing input", "Add at least one scan folder or choose a single playlist.")
             return None
         return RunOptions(
             vdj_root=Path(vdj_var.get()),
+            playlist_path=playlist_path,
             scan_roots=scan_roots,
             include_database=include_database_var.get(),
             apply=apply,
@@ -1451,6 +1677,8 @@ def launch_gui() -> None:
             resume_scan=resume_var.get(),
             dedupe_exact_candidates=dedupe_var.get(),
             dedupe_playlist_entries=playlist_dedupe_var.get(),
+            prefer_scan_root_order=scan_root_priority_var.get(),
+            ignore_file_extension=ignore_extension_var.get(),
             allow_whitespace_filename_fallback=whitespace_var.get(),
         )
 
@@ -1494,11 +1722,12 @@ def launch_gui() -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    playlist_path = playlist_path_from_args(args)
     if args.gui or (not args.no_gui and not args.scan_root):
-        launch_gui()
+        launch_gui(playlist_path)
         return 0
-    if not args.scan_root:
-        parser.error("at least one --scan-root is required when --no-gui is used")
+    if not args.scan_root and playlist_path is None:
+        parser.error("at least one --scan-root or --playlist is required when --no-gui is used")
     options = options_from_args(args)
     result = run_relocator(options, log=print)
     print(format_result(result))
