@@ -7,7 +7,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from vdj_relocator import RunOptions, build_arg_parser, playlist_path_from_args, run_relocator
+from vdj_relocator import RunOptions, build_arg_parser, playlist_path_from_args, restore_latest_backup, run_relocator
 
 
 class PlaylistDedupTests(unittest.TestCase):
@@ -198,6 +198,62 @@ class PlaylistDedupTests(unittest.TestCase):
         args = parser.parse_args(["--gui", str(dropped_playlist)])
 
         self.assertEqual(playlist_path_from_args(args), dropped_playlist)
+
+    def test_undo_restores_latest_backup_and_saves_safety_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            playlist_dir = root / "VirtualDJ" / "Playlists"
+            music_dir = root / "Music"
+            playlist_dir.mkdir(parents=True)
+            music_dir.mkdir()
+            song = music_dir / "Song.mp3"
+            song.write_bytes(b"song")
+
+            playlist = playlist_dir / "Relocate.m3u"
+            playlist.write_text(
+                "\r\n".join(["#EXTM3U", r"Z:\Missing\Song.mp3", ""]),
+                encoding="ascii",
+            )
+
+            original_text = playlist.read_text(encoding="ascii")
+
+            options = self.make_options(root)
+            result = run_relocator(options)
+            self.assertIsNotNone(result.backup_path)
+            self.assertEqual(result.updated, 1)
+
+            playlist.write_text("changed state", encoding="ascii")
+
+            self.assertTrue(restore_latest_backup(options))
+            self.assertEqual(playlist.read_text(encoding="ascii"), original_text)
+            safety_path = result.backup_path / "undo-safety" / "Playlists" / "Relocate.m3u"
+            self.assertTrue(safety_path.exists())
+            self.assertEqual(safety_path.read_text(encoding="ascii"), "changed state")
+
+    def test_restore_falls_back_to_legacy_backups_without_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            vdj_root = root / "VirtualDJ"
+            backup_dir = root / "backups"
+            playlist_dir = vdj_root / "Playlists"
+            playlist_dir.mkdir(parents=True)
+            backup_root = backup_dir / "vdj-relocator-backup-legacy"
+            backup_root.mkdir(parents=True)
+
+            playlist = playlist_dir / "Legacy.m3u"
+            original_text = "#EXTM3U\n\nLegacy\n"
+            playlist.write_text(original_text, encoding="ascii")
+            backup_playlist = backup_root / "Playlists" / "Legacy.m3u"
+            backup_playlist.parent.mkdir(parents=True)
+            backup_playlist.write_text(original_text, encoding="ascii")
+
+            options = self.make_options(root)
+            options.backup_dir = backup_dir
+            options.vdj_root = vdj_root
+
+            playlist.write_text("changed", encoding="ascii")
+            self.assertTrue(restore_latest_backup(options))
+            self.assertEqual(playlist.read_text(encoding="ascii"), original_text)
 
     def test_scan_root_priority_resolves_no_size_ambiguous_filename(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

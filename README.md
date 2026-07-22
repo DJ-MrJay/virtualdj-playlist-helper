@@ -70,6 +70,16 @@ The helper does not use ID3, FLAC, or other audio metadata tags to guess matches
 
 Apply mode creates backups before editing anything.
 
+Undo restores the latest apply backup and creates a safety copy of the current file before overwriting it. New backups include a manifest so undo can restore them directly; older backups without a manifest still fall back to a directory-based restore path.
+
+To restore the latest backup from the command line:
+
+```bat
+python vdj_relocator.py --undo
+```
+
+The same action is available through the script entry point when you need to revert the most recent apply run.
+
 ## Installation
 
 1. Download or clone this repository.

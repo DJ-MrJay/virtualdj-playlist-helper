@@ -1266,6 +1266,118 @@ def replacement_text(entry: MissingEntry) -> str:
     return entry.new_path
 
 
+def backup_manifest_path(backup_root: Path) -> Path:
+    return backup_root / "backup-manifest.json"
+
+
+def write_backup_manifest(backup_root: Path, manifest_entries: list[dict[str, str]]) -> None:
+    manifest_path = backup_manifest_path(backup_root)
+    manifest_path.write_text(json.dumps({"version": 1, "files": manifest_entries}, indent=2), encoding="utf-8")
+
+
+def load_backup_manifest(backup_root: Path) -> list[tuple[Path, Path]]:
+    manifest_path = backup_manifest_path(backup_root)
+    if not manifest_path.exists():
+        return []
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return []
+    files = manifest.get("files", [])
+    if not isinstance(files, list):
+        return []
+    entries: list[tuple[Path, Path]] = []
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        backup_path_value = item.get("backup_path")
+        target_path_value = item.get("target_path")
+        if not backup_path_value or not target_path_value:
+            continue
+        backup_path = Path(backup_path_value)
+        target_path = Path(target_path_value)
+        if not backup_path.is_absolute():
+            backup_path = backup_root / backup_path
+        if not target_path.is_absolute():
+            target_path = Path(target_path_value)
+        entries.append((backup_path, target_path))
+    return entries
+
+
+def resolve_backup_target(target_path: str | Path, vdj_root: Path) -> Path:
+    path = Path(target_path)
+    if path.is_absolute():
+        return path
+    return vdj_root / path
+
+
+def iter_backup_restore_targets(backup_root: Path, vdj_root: Path) -> list[tuple[Path, Path]]:
+    manifest_entries = load_backup_manifest(backup_root)
+    if manifest_entries:
+        restore_targets: list[tuple[Path, Path]] = []
+        for backup_path, target_path in manifest_entries:
+            if not backup_path.is_absolute():
+                backup_path = backup_root / backup_path
+            target_path = resolve_backup_target(target_path, vdj_root)
+            restore_targets.append((backup_path, target_path))
+        return restore_targets
+
+    restore_targets: list[tuple[Path, Path]] = []
+    for path in sorted(backup_root.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.name == "backup-manifest.json":
+            continue
+        try:
+            relative = path.relative_to(backup_root)
+        except ValueError:
+            continue
+        if relative.parts and relative.parts[0] == "undo-safety":
+            continue
+        restore_targets.append((path, vdj_root / relative))
+    return restore_targets
+
+
+def restore_latest_backup(options: RunOptions, log: Callable[[str], None] = log_noop) -> bool:
+    if not options.backup_dir.exists():
+        log(f"Backup folder does not exist: {options.backup_dir}")
+        return False
+
+    backup_roots = sorted(
+        [path for path in options.backup_dir.glob("vdj-relocator-backup-*") if path.is_dir()],
+        key=lambda path: path.name,
+        reverse=True,
+    )
+    if not backup_roots:
+        log(f"No backup folders found in {options.backup_dir}")
+        return False
+
+    backup_root = backup_roots[0]
+    restore_targets = iter_backup_restore_targets(backup_root, options.vdj_root)
+    if not restore_targets:
+        log(f"No files available to restore from {backup_root}")
+        return False
+
+    restored_count = 0
+    for backup_path, target_path in restore_targets:
+        if not backup_path.exists():
+            continue
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if target_path.exists():
+            try:
+                relative_target = target_path.relative_to(options.vdj_root)
+            except ValueError:
+                relative_target = Path(target_path.name)
+            safety_path = backup_root / "undo-safety" / relative_target
+            safety_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(target_path, safety_path)
+        shutil.copy2(backup_path, target_path)
+        restored_count += 1
+
+    log(f"Restored {restored_count} files from {backup_root}")
+    return restored_count > 0
+
+
 def apply_changes(
     sources: list[SourceFile],
     entries: list[MissingEntry],
@@ -1281,6 +1393,7 @@ def apply_changes(
     backup_root.mkdir(parents=True, exist_ok=True)
     source_map = {source.path: source for source in sources}
     changed_sources = 0
+    manifest_entries: list[dict[str, str]] = []
     changed_paths = {entry.source_path for entry in updates} | {duplicate.source_path for duplicate in removals}
     for source_path in sorted(changed_paths):
         source = source_map[source_path]
@@ -1288,6 +1401,7 @@ def apply_changes(
         backup_path = backup_root / relative
         backup_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_path, backup_path)
+        manifest_entries.append({"backup_path": str(relative), "target_path": str(relative)})
         source_entries = [entry for entry in updates if entry.source_path == source_path]
         source_removals = [duplicate for duplicate in removals if duplicate.source_path == source_path]
         operations: list[tuple[int, int, str]] = []
@@ -1308,6 +1422,7 @@ def apply_changes(
             if any(duplicate.edit_start <= entry.edit_start < duplicate.edit_end for duplicate in source_removals):
                 entry.action = "removed_duplicate"
         changed_sources += 1
+    write_backup_manifest(backup_root, manifest_entries)
     log(f"Applied changes to {changed_sources} source files.")
     return backup_root, changed_sources
 
@@ -1476,6 +1591,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--playlist", type=Path, help="Only process this .m3u or .m3u8 playlist file.")
     parser.add_argument("--scan-root", type=Path, action="append", default=[], help="Folder to search for relocated music. May be supplied multiple times.")
     parser.add_argument("--apply", action="store_true", help="Write confirmed replacements. Without this, only a report is written.")
+    parser.add_argument("--undo", action="store_true", help="Restore the latest apply backup and save safety copies of overwritten files.")
     parser.add_argument("--no-database", action="store_true", help="Do not scan/update database.xml; only playlists and .vdjfolder files are checked.")
     parser.add_argument("--search-mode", choices=("auto", "scan", "everything"), default="auto", help="auto uses Everything CLI if es.exe exists, otherwise scans selected folders.")
     parser.add_argument("--report-dir", type=Path, default=DEFAULT_REPORT_DIR, help=f"Report output folder. Default: {DEFAULT_REPORT_DIR}")
@@ -1626,9 +1742,11 @@ def launch_gui(initial_playlist: Path | None = None) -> None:
     button_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(12, 0))
     dry_button = ttk.Button(button_frame, text="Dry Run")
     apply_button = ttk.Button(button_frame, text="Apply Fixes")
+    undo_button = ttk.Button(button_frame, text="Undo Last Apply")
     stop_button = ttk.Button(button_frame, text="Stop", state="disabled")
     dry_button.pack(side="left")
     apply_button.pack(side="left", padx=(8, 0))
+    undo_button.pack(side="left", padx=(8, 0))
     stop_button.pack(side="left", padx=(8, 0))
 
     ttk.Label(main, text="Status").grid(row=7, column=0, sticky="w", pady=(12, 0))
@@ -1651,6 +1769,7 @@ def launch_gui(initial_playlist: Path | None = None) -> None:
         state = "disabled" if running else "normal"
         dry_button.configure(state=state)
         apply_button.configure(state=state)
+        undo_button.configure(state=state)
         stop_button.configure(state="normal" if running else "disabled")
 
     def build_options(apply: bool) -> RunOptions | None:
@@ -1708,12 +1827,50 @@ def launch_gui(initial_playlist: Path | None = None) -> None:
         worker = threading.Thread(target=worker_main, daemon=True)
         worker.start()
 
+    def run_undo() -> None:
+        nonlocal worker
+        options = RunOptions(
+            vdj_root=Path(vdj_var.get()),
+            playlist_path=None,
+            scan_roots=[],
+            include_database=include_database_var.get(),
+            apply=False,
+            search_mode=search_mode_var.get(),
+            report_dir=DEFAULT_REPORT_DIR,
+            backup_dir=DEFAULT_BACKUP_DIR,
+            state_dir=DEFAULT_STATE_DIR,
+            max_everything_results=1000000,
+            resume_scan=resume_var.get(),
+            dedupe_exact_candidates=dedupe_var.get(),
+            dedupe_playlist_entries=playlist_dedupe_var.get(),
+            prefer_scan_root_order=scan_root_priority_var.get(),
+            ignore_file_extension=ignore_extension_var.get(),
+            allow_whitespace_filename_fallback=whitespace_var.get(),
+        )
+        set_running(True)
+        status_text.delete("1.0", tk.END)
+
+        def worker_main() -> None:
+            try:
+                restored = restore_latest_backup(options, log=status_queue.put)
+                status_queue.put(f"Undo {'succeeded' if restored else 'failed'}")
+                root.after(0, lambda: messagebox.showinfo("Undo", "Undo completed." if restored else "No matching backup was found to restore."))
+            except Exception as exc:
+                status_queue.put(f"Error: {exc}")
+                root.after(0, lambda: messagebox.showerror("Error", str(exc)))
+            finally:
+                root.after(0, lambda: set_running(False))
+
+        worker = threading.Thread(target=worker_main, daemon=True)
+        worker.start()
+
     def stop_job() -> None:
         cancel_event.set()
         append_status("Stop requested. Waiting for the current safe point...")
 
     dry_button.configure(command=lambda: run_job(False))
     apply_button.configure(command=lambda: run_job(True))
+    undo_button.configure(command=run_undo)
     stop_button.configure(command=stop_job)
     poll_status()
     root.mainloop()
@@ -1723,6 +1880,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     playlist_path = playlist_path_from_args(args)
+    if args.undo:
+        options = options_from_args(args)
+        restored = restore_latest_backup(options, log=print)
+        print(f"Undo {'succeeded' if restored else 'failed'}")
+        return 0 if restored else 1
     if args.gui or (not args.no_gui and not args.scan_root):
         launch_gui(playlist_path)
         return 0
